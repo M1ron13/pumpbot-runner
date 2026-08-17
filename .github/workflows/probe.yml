@@ -1,0 +1,18 @@
+name: probe-endpoints
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Какие источники доступны с раннера
+        run: |
+          probe() { code=$(curl -s -o /tmp/body -w "%{http_code}" --max-time 15 "$2"); echo "$1 -> HTTP $code ($(wc -c </tmp/body) байт)"; }
+          probe "binance-fapi        " "https://fapi.binance.com/fapi/v1/ticker/24hr"
+          probe "binance-vision-spot " "https://data-api.binance.vision/api/v3/ticker/24hr"
+          probe "bybit-api           " "https://api.bybit.com/v5/market/tickers?category=linear"
+          probe "bybit-bytick-mirror " "https://api.bytick.com/v5/market/tickers?category=linear"
+          probe "gate-futures        " "https://api.gateio.ws/api/v4/futures/usdt/tickers"
+          probe "mexc-futures        " "https://contract.mexc.com/api/v1/contract/ticker"
+          probe "okx-swap            " "https://www.okx.com/api/v5/market/tickers?instType=SWAP"
+          probe "kucoin-futures      " "https://api-futures.kucoin.com/api/v1/contracts/active"
+          probe "bitget-futures      " "https://api.bitget.com/api/v2/mix/market/tickers?productType=usdt-futures"
