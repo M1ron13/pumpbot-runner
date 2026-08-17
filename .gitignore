@@ -1,0 +1,9 @@
+config.local.json
+*.log
+state.json.gz
+state.json.gz.tmp
+pump_bot.pid
+__pycache__/
+*.pyc
+.venv/
+gas/Config.gs

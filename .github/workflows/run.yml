@@ -1,0 +1,102 @@
+name: pumpbot
+
+# 24/7-цепочка: каждый ран живёт 5ч45м, сохраняет состояние и передаёт эстафету.
+# Страховка — cron раз в 5 часов: если цепочка оборвалась, следующий ран поднимет её сам.
+# concurrency с cancel-in-progress: false ставит новый ран в очередь, а не плодит второй инстанс.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */5 * * *"
+
+concurrency:
+  group: pumpbot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # состояние предыдущего рана: сначала artifact, если нет — кэш; отсутствие не ломает старт
+      - name: Восстановить состояние
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          id=$(gh api "repos/$REPO/actions/artifacts?per_page=100" \
+                --jq '[.artifacts[] | select(.name=="pumpbot-state" and .expired==false)]
+                      | sort_by(.created_at) | reverse | .[0].id // empty')
+          if [ -n "$id" ]; then
+            gh api "repos/$REPO/actions/artifacts/$id/zip" > state.zip \
+              && unzip -o state.zip \
+              && echo "состояние подтянуто из artifact $id" \
+              && ls -la state.json.gz
+          else
+            echo "artifact со состоянием не найден — холодный старт"
+          fi
+
+      - name: Кэш состояния (страховка при отмене рана)
+        uses: actions/cache@v4
+        with:
+          path: state.json.gz
+          key: pumpbot-state-${{ github.run_id }}
+          restore-keys: pumpbot-state-
+
+      - name: Запустить бота
+        env:
+          PUMPBOT_TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          PUMPBOT_TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PUMPBOT_STATE_FILE: state.json.gz
+          PUMPBOT_LOG_FILE: pump_bot.log
+          PUMPBOT_MAX_RUNTIME_SEC: "20700"   # 5ч45м — сам гасится с сохранением состояния
+          PUMPBOT_STATE_SAVE_SEC: "900"
+          PUMPBOT_RUNTIME_LABEL: "GitHub Actions"
+        run: python pump_bot.py
+
+      - name: Сохранить состояние
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pumpbot-state
+          path: state.json.gz
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: warn
+
+      - name: Лог рана
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pumpbot-log
+          path: pump_bot.log
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: warn
+
+      # эстафета следующему рану. Без GH_PAT шаг тихо пропускается — тогда цепочку
+      # держит cron (пауза до 5 часов). GITHUB_TOKEN здесь не годится: события от него
+      # намеренно не запускают новые workflow-раны.
+      - name: Передать эстафету
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "GH_PAT не задан — следующий ран стартует по cron"
+            exit 0
+          fi
+          gh workflow run run.yml --repo "${{ github.repository }}"
+          echo "следующий ран запущен"
