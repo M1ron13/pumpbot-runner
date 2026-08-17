@@ -6,6 +6,7 @@
 Запуск:  python -m unittest discover -s tests -v
 """
 
+import asyncio
 import os
 import random
 import shutil
@@ -280,3 +281,142 @@ class StateSnapshotTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class BackfillTestCase(unittest.TestCase):
+    """Backfill из свечей: слепой зоны после старта и разрывов нет."""
+
+    def setUp(self):
+        self._real_now = pump_bot.now
+        self.t = START_TS
+        pump_bot.now = lambda: self.t
+
+    def tearDown(self):
+        pump_bot.now = self._real_now
+
+    # -- синтетические свечи --------------------------------------------- #
+
+    def candles(self, minutes=240, pump_pct=0.0, pump_vol_mult=1.0, base=0.04, vol=60_000.0):
+        """Минутные свечи: спокойный рынок, при pump_pct — скачок на последней минуте."""
+        rng = random.Random(11)
+        out = []
+        price = base
+        start = self.t - minutes * 60
+        for i in range(minutes):
+            price = base * (1.0 + rng.uniform(-NOISE_PCT, NOISE_PCT) / 100.0)
+            quote_vol = vol
+            if pump_pct and i == minutes - 1:
+                price = base * (1.0 + pump_pct / 100.0)
+                quote_vol = vol * pump_vol_mult * 15  # весь всплеск в последнюю минуту окна
+            out.append(pump_bot.Candle(ts=start + i * 60, close=price, quote_volume=quote_vol))
+        return out
+
+    def snapshots(self, candles, symbol="XYZUSDT"):
+        last = candles[-1]
+        return [pump_bot.Snapshot(exchange=ex, symbol=symbol, price=last.close,
+                                  quote_volume_24h=BASE_24H_VOL, funding_rate=None)
+                for ex in ("BINANCE", "BYBIT")]
+
+    def make_backfill(self, cfg, fetcher):
+        return pump_bot.Backfill(cfg, fetcher, weight_source=lambda: 100.0,
+                                 sleeper=lambda _sec: asyncio.sleep(0))
+
+    # 1 ------------------------------------------------------------------ #
+    def test_backfill_detects_pump_at_startup(self):
+        """Свечи с пампом +10%/15м и объёмом 6x → алерт сразу, без прогрева."""
+        cfg = make_cfg()
+        candles = self.candles(pump_pct=10.0, pump_vol_mult=6.0)
+
+        async def fetcher(exchange, symbol, limit):
+            return candles
+
+        detector = pump_bot.Detector(cfg)
+        stats = asyncio.run(self.make_backfill(cfg, fetcher).run(detector, self.snapshots(candles)))
+        self.assertEqual(stats["seeded"], 2, "должны подняться оба ключа биржа:символ")
+
+        detector.startup_pass = True
+        self.t += 60
+        alerts = detector.step(self.snapshots(candles))
+        self.assertEqual(len(alerts), 1, "памп из свечей обнаруживается на первом же проходе")
+        alert = alerts[0]
+        self.assertTrue(alert.at_startup)
+        self.assertGreater(alert.primary.zscore, 4.0)
+        self.assertIn("⏱ обнаружен при старте", pump_bot.render_alert(alert, cfg))
+
+    # 2 ------------------------------------------------------------------ #
+    def test_backfill_failure_falls_back_to_warmup(self):
+        """Пустой ответ и исключение — не падаем, работает обычный прогрев."""
+        cfg = make_cfg()
+        candles = self.candles()
+
+        async def empty(exchange, symbol, limit):
+            return None
+
+        async def boom(exchange, symbol, limit):
+            raise RuntimeError("биржа недоступна")
+
+        for fetcher in (empty, boom):
+            detector = pump_bot.Detector(cfg)
+            stats = asyncio.run(self.make_backfill(cfg, fetcher).run(detector, self.snapshots(candles)))
+            self.assertEqual(stats["seeded"], 0)
+            self.assertEqual(stats["failed"], 2)
+            self.assertEqual(detector.states, {}, "без свечей история не подсевается")
+
+        # прогрев остаётся обязательным там, где backfill не удался
+        detector = pump_bot.Detector(cfg)
+        detector.step(self.snapshots(candles))
+        key = pump_bot.Detector.key("BINANCE", "XYZUSDT")
+        self.assertFalse(detector.states[key].backfilled)
+
+    # 3 ------------------------------------------------------------------ #
+    def test_backfill_calm_market_no_false_alerts(self):
+        """Спокойные свечи → при старте ложных алертов нет."""
+        cfg = make_cfg()
+        candles = self.candles()
+
+        async def fetcher(exchange, symbol, limit):
+            return candles
+
+        detector = pump_bot.Detector(cfg)
+        asyncio.run(self.make_backfill(cfg, fetcher).run(detector, self.snapshots(candles)))
+        detector.startup_pass = True
+        self.t += 60
+        self.assertEqual(detector.step(self.snapshots(candles)), [],
+                         "на спокойной истории старт не должен давать сигналов")
+
+    # 4 ------------------------------------------------------------------ #
+    def test_incremental_backfill_has_no_duplicates(self):
+        """Разрыв 5 минут → добираются только пропущенные минуты, дублей нет."""
+        cfg = make_cfg()
+        first = self.candles(minutes=240)
+
+        async def fetch_first(exchange, symbol, limit):
+            return first
+
+        detector = pump_bot.Detector(cfg)
+        backfill = self.make_backfill(cfg, fetch_first)
+        asyncio.run(backfill.run(detector, self.snapshots(first)))
+
+        key = pump_bot.Detector.key("BINANCE", "XYZUSDT")
+        state = detector.states[key]
+        moves_before = len(state.moves_15m)
+        ticks_before = len(state.ticks)
+        last_tick_before = state.ticks[-1][0]
+
+        # прошло 5 минут без данных, свечи продлились на 5 минут вперёд
+        self.t += 5 * 60
+        second = self.candles(minutes=245)
+
+        async def fetch_second(exchange, symbol, limit):
+            return second
+
+        asyncio.run(self.make_backfill(cfg, fetch_second).run(
+            detector, self.snapshots(second), minutes=5.0, label="разрыв"))
+
+        state = detector.states[key]
+        self.assertEqual(len(state.moves_15m), moves_before + 5,
+                         "добавиться должны ровно 5 наблюдений — по числу пропущенных минут")
+        self.assertEqual(len(state.ticks), ticks_before + 5)
+        self.assertGreater(state.ticks[-1][0], last_tick_before)
+        self.assertEqual(len(set(t[0] for t in state.ticks)), len(state.ticks),
+                         "дублей по времени в тиках быть не должно")

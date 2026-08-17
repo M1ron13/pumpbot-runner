@@ -138,6 +138,14 @@ class Snapshot:
 
 
 @dataclass
+class Candle:
+    """Минутная свеча: время открытия (сек), закрытие, quote volume."""
+    ts: float
+    close: float
+    quote_volume: float
+
+
+@dataclass
 class SymbolState:
     """История по одному ключу EXCHANGE:SYMBOL (in-memory)."""
     first_seen: float
@@ -145,6 +153,7 @@ class SymbolState:
     moves_15m: deque = field(default_factory=deque)
     vols_15m: deque = field(default_factory=deque)
     funding_rate: Optional[float] = None
+    backfilled: bool = False   # история поднята из свечей → 120-минутный прогрев не нужен
 
     @classmethod
     def create(cls, ts: float, ticks_maxlen: int, history_maxlen: int) -> "SymbolState":
@@ -197,6 +206,55 @@ class SymbolState:
         return delta
 
 
+def history_from_candles(
+    candles: List[Candle],
+    window_main_sec: float,
+    ticks_window_sec: float,
+    current_volume_24h: Optional[float] = None,
+) -> Optional[dict]:
+    """Восстановить `moves_15m`, `vols_15m` и хвост тиков из минутных свечей.
+
+    - moves: для каждой минуты t доходность close[t] / close[t-15] в процентах;
+    - vols: сумма quote volume по скользящему окну из 15 свечей (то же окно);
+    - ticks: последние ~30 минут как (время, close, накопительный объём), чтобы
+      расчёты по окнам работали сразу, без ожидания живых тиков.
+
+    Накопительный объём подгоняется так, чтобы на последней свече он совпал
+    с реальным 24h-объёмом из тикера: тик[2] служит и фильтром ликвидности,
+    и базой для дельт, поэтому уровень должен быть настоящим.
+    """
+    span = int(round(window_main_sec / 60.0))
+    if len(candles) < span + 1:
+        return None
+    candles = sorted(candles, key=lambda c: c.ts)
+
+    moves: List[float] = []
+    vols: List[float] = []
+    for i in range(span, len(candles)):
+        past_close = candles[i - span].close
+        if past_close <= 0:
+            continue
+        moves.append((candles[i].close / past_close - 1.0) * 100.0)
+        vols.append(sum(c.quote_volume for c in candles[i - span + 1:i + 1]))
+
+    tick_count = max(2, int(round(ticks_window_sec / 60.0)) + 1)
+    tail = candles[-tick_count:]
+    tail_volume = sum(c.quote_volume for c in tail)
+    base = (current_volume_24h - tail_volume) if current_volume_24h is not None else 0.0
+    if base < 0:
+        base = 0.0
+
+    ticks: List[Tuple[float, float, float]] = []
+    running = base
+    for candle in tail:
+        running += candle.quote_volume
+        ticks.append((candle.ts + 60.0, candle.close, running))
+
+    if not moves or not vols or len(ticks) < 2:
+        return None
+    return {"moves": moves, "vols": vols, "ticks": ticks, "first_ts": candles[0].ts}
+
+
 @dataclass
 class Signal:
     """Сработавший триггер по одной бирже (до дедупа)."""
@@ -220,6 +278,7 @@ class Alert:
     exchanges: List[str]
     primary: Signal
     ts: float
+    at_startup: bool = False   # найден на первом проходе после backfill
 
     @property
     def is_fast(self) -> bool:
@@ -241,6 +300,7 @@ class Detector:
         self.al = cfg["alerts"]
         self.states: Dict[str, SymbolState] = {}
         self.last_alert_ts: Dict[str, float] = {}
+        self.startup_pass = False   # True на проходе сразу после backfill: алерт помечается
         self.alert_history: deque = deque()
         self.binance_funding: Dict[str, float] = {}
 
@@ -269,6 +329,53 @@ class Detector:
                 funding = self.binance_funding.get(snap.symbol) if snap.exchange == "BINANCE" else None
             if funding is not None:
                 state.funding_rate = funding
+
+    # -- подсев истории из свечей ------------------------------------------- #
+
+    def seed_from_candles(
+        self,
+        exchange: str,
+        symbol: str,
+        candles: List[Candle],
+        current_volume_24h: Optional[float] = None,
+        ticks_window_sec: float = 1800.0,
+    ) -> bool:
+        """Заполнить историю символа из свечей. True — если получилось.
+
+        Работает и как первичный backfill, и как инкрементальный после разрыва:
+        новые наблюдения добавляются только за минуты, которых ещё нет
+        (по времени последнего тика), поэтому дублей в `moves_15m` не будет.
+        """
+        history = history_from_candles(
+            candles, self.det["window_main_sec"], ticks_window_sec, current_volume_24h
+        )
+        if history is None:
+            return False
+
+        key = self.key(exchange, symbol)
+        state = self.states.get(key)
+        if state is None:
+            state = SymbolState.create(history["first_ts"], self.det["ticks_maxlen"], self.det["history_maxlen"])
+            self.states[key] = state
+            state.moves_15m.extend(history["moves"])
+            state.vols_15m.extend(history["vols"])
+            for tick in history["ticks"]:
+                state.add_tick(*tick)
+        else:
+            last_ts = state.ticks[-1][0] if state.ticks else 0.0
+            fresh_ticks = [t for t in history["ticks"] if t[0] > last_ts]
+            if not fresh_ticks and state.moves_15m:
+                return False  # разрыва фактически не было, дублировать нечего
+            minutes_missing = len(fresh_ticks)
+            if minutes_missing:
+                # столько же новых наблюдений статистики, сколько пропущенных минут
+                state.moves_15m.extend(history["moves"][-minutes_missing:])
+                state.vols_15m.extend(history["vols"][-minutes_missing:])
+                for tick in fresh_ticks:
+                    state.add_tick(*tick)
+            state.first_seen = min(state.first_seen, history["first_ts"])
+        state.backfilled = True
+        return True
 
     # -- снимок состояния на диск ------------------------------------------ #
 
@@ -396,8 +503,8 @@ class Detector:
                 continue
             if last[2] < self.uni["min_24h_volume_usd"]:
                 continue
-            if ts - state.first_seen < min_history_sec:
-                continue
+            if ts - state.first_seen < min_history_sec and not state.backfilled:
+                continue  # прогрев обязателен только там, где backfill не удался
             if move_15m is None or vol_15m is None:
                 continue
             if len(hist_moves) < min_obs or len(hist_vols) < min_obs:
@@ -467,6 +574,7 @@ class Detector:
                 exchanges=sorted({s.exchange for s in group}),
                 primary=primary,
                 ts=ts,
+                at_startup=self.startup_pass,
             ))
 
         merged.sort(key=lambda a: a.primary.zscore, reverse=True)
@@ -505,6 +613,8 @@ def render_alert(alert: Alert, cfg: dict) -> str:
     clock = datetime.fromtimestamp(alert.ts, tz=timezone.utc).strftime("%H:%M:%S")
 
     lines = [f"🔴 <b>PUMP: {base}/{quote}</b> [{exchanges}]"]
+    if alert.at_startup:
+        lines.append("⏱ обнаружен при старте")
     if alert.is_fast and sig.move_5m is not None:
         lines.append(f"⚡ <b>FAST +{sig.move_5m:.1f}%/5м — вертикаль</b>")
     move_line = f"📈 +{sig.move_15m:.1f}% / 15м"
@@ -539,6 +649,7 @@ class Feed:
         self.session = session
         self.backoff_until: Dict[str, float] = {}
         self.backoff_sec: Dict[str, float] = {}
+        self.used_weight = 0.0   # X-MBX-USED-WEIGHT-1M последнего ответа Binance
 
     def throttled(self, name: str) -> bool:
         until = self.backoff_until.get(name, 0.0)
@@ -569,6 +680,12 @@ class Feed:
                     log.warning("%s: HTTP %s", name, resp.status)
                     return None
                 data = await resp.json(content_type=None)
+                weight = resp.headers.get(self.net["binance_weight_header"])
+                if weight is not None:
+                    try:
+                        self.used_weight = float(weight)
+                    except ValueError:
+                        pass
                 self._reset_backoff(name)
                 return data
         except asyncio.TimeoutError:
@@ -613,6 +730,43 @@ class Feed:
                 continue
         return out
 
+    async def binance_klines(self, symbol: str, limit: int) -> Optional[List[Candle]]:
+        url = self.net["binance_klines_url"].format(symbol=symbol, limit=limit)
+        data = await self.get_json("binance/klines", url)
+        if not isinstance(data, list):
+            return None
+        out: List[Candle] = []
+        for item in data:
+            try:  # [openTime, o, h, l, c, volume, closeTime, quoteAssetVolume, ...]
+                out.append(Candle(ts=float(item[0]) / 1000.0, close=float(item[4]),
+                                  quote_volume=float(item[7])))
+            except (IndexError, TypeError, ValueError):
+                continue
+        return out or None
+
+    async def bybit_klines(self, symbol: str, limit: int) -> Optional[List[Candle]]:
+        url = self.net["bybit_klines_url"].format(symbol=symbol, limit=limit)
+        data = await self.get_json("bybit/klines", url)
+        if not isinstance(data, dict):
+            return None
+        rows = (data.get("result") or {}).get("list") or []
+        out: List[Candle] = []
+        for item in rows:  # [startMs, o, h, l, c, volume, turnover] — приходят от новых к старым
+            try:
+                out.append(Candle(ts=float(item[0]) / 1000.0, close=float(item[4]),
+                                  quote_volume=float(item[6])))
+            except (IndexError, TypeError, ValueError):
+                continue
+        out.sort(key=lambda c: c.ts)
+        return out or None
+
+    async def candles(self, exchange: str, symbol: str, limit: int) -> Optional[List[Candle]]:
+        if exchange == "BINANCE":
+            return await self.binance_klines(symbol, min(limit, self.net["binance_klines_max"]))
+        if exchange == "BYBIT":
+            return await self.bybit_klines(symbol, min(limit, self.net["bybit_klines_max"]))
+        return None
+
     async def binance_funding(self) -> Dict[str, float]:
         data = await self.get_json("binance/premiumIndex", self.net["binance_premium_index_url"])
         out: Dict[str, float] = {}
@@ -624,6 +778,81 @@ class Feed:
             except (KeyError, TypeError, ValueError):
                 continue
         return out
+
+
+class Backfill:
+    """Восстановление истории из свечей: батчи, контроль веса, устойчивость к отказам.
+
+    Fetcher передаётся снаружи (`async fetch(exchange, symbol, limit)`), поэтому
+    тесты гоняют backfill на заглушке без сети.
+    """
+
+    def __init__(self, cfg: dict, fetch_candles, weight_source=None, sleeper=None):
+        self.cfg = cfg
+        self.bf = cfg["backfill"]
+        self.uni = cfg["universe"]
+        self.det = cfg["detection"]
+        self.fetch_candles = fetch_candles
+        self.weight_source = weight_source or (lambda: 0.0)
+        self.sleeper = sleeper or asyncio.sleep
+
+    def targets(self, snapshots: Iterable[Snapshot]) -> List[Tuple[str, str, float]]:
+        """Только ликвидная часть вселенной + BTC (нужен для фильтра режима рынка)."""
+        btc = self.cfg["btc_filter"]["btc_symbol"]
+        suffix = self.uni["quote_suffix"]
+        out = []
+        for snap in snapshots:
+            if not snap.symbol.endswith(suffix):
+                continue
+            if snap.quote_volume_24h < self.uni["min_24h_volume_usd"] and snap.symbol != btc:
+                continue
+            out.append((snap.exchange, snap.symbol, snap.quote_volume_24h))
+        return out
+
+    async def run(self, detector: Detector, snapshots: Iterable[Snapshot],
+                  minutes: Optional[float] = None, label: str = "старт") -> dict:
+        targets = self.targets(snapshots)
+        span_min = int(round(self.det["window_main_sec"] / 60.0))
+        if minutes is None:
+            need = int(self.bf["lookback_minutes"])
+        else:
+            need = int(minutes) + span_min + int(self.bf["gap_margin_minutes"])
+        limit = max(span_min + 2, need)
+
+        batch_size = int(self.bf["batch_size"])
+        ok = failed = 0
+        for start in range(0, len(targets), batch_size):
+            batch = targets[start:start + batch_size]
+            await self._respect_weight()
+            results = await asyncio.gather(
+                *(self.fetch_candles(ex, sym, limit) for ex, sym, _ in batch),
+                return_exceptions=True,
+            )
+            for (exchange, symbol, vol24h), candles in zip(batch, results):
+                if isinstance(candles, Exception) or not candles:
+                    failed += 1
+                    continue
+                seeded = detector.seed_from_candles(
+                    exchange, symbol, candles, current_volume_24h=vol24h,
+                    ticks_window_sec=self.bf["ticks_window_sec"],
+                )
+                ok += 1 if seeded else 0
+            log.info("backfill (%s) %s/%s символов, вес %.0f/%s, отказов %s",
+                     label, min(start + batch_size, len(targets)), len(targets),
+                     self.weight_source(), self.bf["binance_weight_limit"], failed)
+            if start + batch_size < len(targets):
+                await self.sleeper(self.bf["batch_pause_sec"])
+        log.info("backfill (%s) завершён: поднято %s символов, отказов %s", label, ok, failed)
+        return {"seeded": ok, "failed": failed, "targets": len(targets)}
+
+    async def _respect_weight(self) -> None:
+        """Binance считает вес запросов в минуту — у порога ждём начала новой минуты."""
+        if self.weight_source() <= self.bf["binance_weight_limit"]:
+            return
+        pause = 60.0 - (now() % 60.0)
+        log.warning("вес Binance %.0f выше порога %s — пауза %.0f сек",
+                    self.weight_source(), self.bf["binance_weight_limit"], pause)
+        await self.sleeper(pause)
 
 
 class Telegram:
@@ -714,6 +943,8 @@ class PumpBot:
         self._last_state_save = 0.0
         self._consecutive_failures = 0
         self._restored = 0
+        self._last_data_ts = 0.0
+        self._backfill_stats = {}
 
     def request_stop(self, reason: str = "сигнал") -> None:
         if not self.stopping:
@@ -770,12 +1001,15 @@ class PumpBot:
         async with aiohttp.ClientSession() as session:
             feed = Feed(self.cfg, session)
             telegram = Telegram(self.cfg, session)
+            backfill = Backfill(self.cfg, feed.candles, weight_source=lambda: feed.used_weight)
+            if self.cfg["backfill"]["enabled"]:
+                await self.initial_backfill(feed, backfill)
             if self.rt.get("startup_ping"):
                 await telegram.send(self.startup_message())
             while not self.stopping:
                 started = now()
                 try:
-                    await self.iteration(feed, telegram)
+                    await self.iteration(feed, telegram, backfill)
                 except Exception as exc:
                     log.exception("необработанная ошибка в итерации: %s", exc)
                     self._consecutive_failures += 1
@@ -815,7 +1049,22 @@ class PumpBot:
             f"{cfg['detection']['volume_mult_main']}× среднего"
         )
 
-    async def iteration(self, feed: Feed, telegram: Telegram) -> None:
+    async def initial_backfill(self, feed: Feed, backfill: Backfill) -> None:
+        """История из свечей при старте: слепой зоны нет, прогрев не нужен."""
+        binance, bybit = await asyncio.gather(feed.binance_tickers(), feed.bybit_tickers())
+        snapshots = list(binance) + list(bybit)
+        if not snapshots:
+            log.warning("backfill пропущен: тикеры недоступны — включается обычный прогрев")
+            return
+        try:
+            self._backfill_stats = await backfill.run(self.detector, snapshots, label="старт")
+        except Exception as exc:
+            log.exception("backfill не удался (%s) — включается обычный прогрев", exc)
+            return
+        if self._backfill_stats.get("seeded"):
+            self.detector.startup_pass = True   # алерты этого прохода помечаются «при старте»
+
+    async def iteration(self, feed: Feed, telegram: Telegram, backfill: Optional[Backfill] = None) -> None:
         binance, bybit = await asyncio.gather(feed.binance_tickers(), feed.bybit_tickers())
 
         if now() - self._last_funding_ts >= self.net["funding_refresh_sec"]:
@@ -831,7 +1080,18 @@ class PumpBot:
             return
         self._consecutive_failures = 0
 
+        gap = now() - self._last_data_ts if self._last_data_ts else 0.0
+        if backfill is not None and self.cfg["backfill"]["enabled"] and                 gap > self.cfg["backfill"]["gap_trigger_sec"]:
+            log.warning("разрыв потока данных %.0f сек — инкрементальный backfill", gap)
+            try:
+                await backfill.run(self.detector, snapshots, minutes=gap / 60.0, label="разрыв")
+                self.detector.startup_pass = True
+            except Exception as exc:
+                log.exception("инкрементальный backfill не удался: %s", exc)
+        self._last_data_ts = now()
+
         alerts = self.detector.step(snapshots)
+        self.detector.startup_pass = False
         for alert in alerts:
             sig = alert.primary
             log.info(
