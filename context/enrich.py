@@ -239,6 +239,12 @@ async def enrich_alert(alert, bot_cfg: dict, session=None, cfg: dict = None,
                     now_ts=now_ts, unlock_text=sig.event_context, price=sig.price),
             timeout=budget_ms / 1000.0)
         block = render.render(context, cfg, now_ts)
+        # весь снимок контекста уезжает в алерт: журнал исходов пишет условия,
+        # при которых сигнал возник, а не только текст сообщения
+        try:
+            alert.context = {**(getattr(alert, "context", None) or {}), **context}
+        except Exception:
+            pass
         cache.log_enrichment(symbol=sig.symbol, verdict=context.get("verdict"), block=block,
                              budget_ms=int(budget_ms), elapsed_ms=int((time.time() - started) * 1000),
                              sources_ok=context.get("sources_ok"),

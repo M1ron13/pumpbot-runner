@@ -23,7 +23,8 @@
     "funding_sec": 300,
     "heartbeat_stale_sec": 900,
     "heartbeat_interval_factor": 3,
-    "rss_sec": 120
+    "rss_sec": 120,
+    "telegram_sec": 60
   },
   "sources": {
     "bybit_announcements": "https://api.bybit.com/v5/announcements/index?locale=en-US&limit=50",
@@ -72,7 +73,8 @@
     "arkham": false,
     "coinglass": false,
     "kucoin_announcements": true,
-    "rss": true
+    "rss": true,
+    "telegram_feed": true
   },
   "_почему_выключено": {
     "okx_announcements": "корп-сеть сбрасывает соединение с okx.com по SNI (проверено 18.08.2026)",
@@ -328,6 +330,28 @@
         "tier": 3,
         "enabled": true,
         "url": "https://cointelegraph.com/rss"
+      }
+    ]
+  },
+  "telegram_feed": {
+    "_комментарий": "Whitelist каналов расширяет ТОЛЬКО владелец. Источник включается после интерактивной авторизации и проходит сутки в тени.",
+    "enabled": true,
+    "session_file": "telegram_session",
+    "phone": "",
+    "lookback_sec": 3600,
+    "poll_sec": 60,
+    "channels": [
+      {
+        "name": "@wublockchainenglish",
+        "tier": 3,
+        "enabled": true,
+        "note": "Wu Blockchain"
+      },
+      {
+        "name": "@TreeNewsFeed",
+        "tier": 3,
+        "enabled": true,
+        "note": "Tree of Alpha news"
       }
     ]
   }

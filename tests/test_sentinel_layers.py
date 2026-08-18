@@ -3,8 +3,11 @@
 Все — оффлайн: время подменяется через pump_bot.now, сеть не трогается.
 """
 
+import io
 import os
+import shutil
 import sys
+import tempfile
 import tempfile
 import shutil
 import unittest
@@ -209,6 +212,134 @@ class AlertRenderTestCase(unittest.TestCase):
         self.assertIn("OI↑ новые деньги", text)
         self.assertIn("📝 новый хай на объёме 17%", text)
 
+
+
+class JournalContextTestCase(unittest.TestCase):
+    """Журнал исходов как заготовка бэктеста: условия, а не только проценты."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="journal-ctx-")
+        self.journal = pump_bot.SignalJournal(os.path.join(self.tmpdir, "signals.db"))
+
+    def tearDown(self):
+        self.journal.close()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def alert_with_context(self):
+        signal = pump_bot.Signal(
+            exchange="BINANCE", symbol="XYZUSDT", triggers=["MAIN", "FAST"], move_15m=9.4,
+            move_5m=7.1, zscore=8.2, vol_mult=6.4, price=100.0, volume_24h=5e7,
+            funding_rate=-0.0012, ts=START_TS, oi_read="SQUEEZE", oi_change_pct=-7.5,
+            event_context="анлок через 3.0 дн · 4.2% supply")
+        return pump_bot.Alert(
+            symbol="XYZUSDT", exchanges=["BINANCE", "BYBIT"], primary=signal, ts=START_TS,
+            kind="PUMP", at_startup=True, btc_mult=1.3,
+            context={
+                "verdict": "КАТАЛИЗАТОР",
+                "derivatives": {"long_short_ratio": 3.4, "taker_buy_sell_ratio": 1.8,
+                                "oi_change_pct": 6.2, "oi_window_min": 30},
+                "basis_pct": 1.4, "basis_verdict": "HOT",
+                "krw_premium": 7.1, "krw_background": 3.4, "krw_excess": 3.7,
+                "funding_state": {"state": "SHORT_EXTREME", "value": -0.0013, "sustained": True},
+                "dex": {"volume_h24": 2.1e6, "price_change_h1": 22.0, "pair": "XYZ/USDC"},
+                "sources_failed": ["tavily: таймаут"],
+                "block": "🧭 КОНТЕКСТ ...",
+            })
+
+    def test_full_context_is_stored(self):
+        row_id = self.journal.record(self.alert_with_context())
+        row = dict(self.journal.conn.execute(
+            "SELECT * FROM signals WHERE id = ?", (row_id,)).fetchone())
+
+        # условия сигнала
+        self.assertAlmostEqual(row["zscore"], 8.2)
+        self.assertAlmostEqual(row["vol_mult"], 6.4)
+        self.assertAlmostEqual(row["btc_mult"], 1.3)
+        self.assertEqual(row["at_startup"], 1)
+        self.assertEqual(row["triggers"], "MAIN+FAST")
+        self.assertEqual(row["exchanges"], "BINANCE,BYBIT")
+        # контекст
+        self.assertAlmostEqual(row["long_short_ratio"], 3.4)
+        self.assertAlmostEqual(row["taker_ratio"], 1.8)
+        self.assertAlmostEqual(row["basis_pct"], 1.4)
+        self.assertEqual(row["basis_verdict"], "HOT")
+        self.assertAlmostEqual(row["krw_excess"], 3.7)
+        self.assertEqual(row["funding_state"], "SHORT_EXTREME")
+        self.assertAlmostEqual(row["funding_8h"], -0.0013)
+        self.assertAlmostEqual(row["dex_volume_h24"], 2.1e6)
+        self.assertEqual(row["context_verdict"], "КАТАЛИЗАТОР")
+        self.assertIn("tavily", row["context_sources_failed"])
+        self.assertIn("КОНТЕКСТ", row["context_block"])
+
+    def test_outcomes_store_price_and_percent(self):
+        row_id = self.journal.record(self.alert_with_context())
+        self.journal.fill(row_id, "out_1h", price_now=110.0, price_then=100.0)
+        row = dict(self.journal.conn.execute(
+            "SELECT out_1h, price_1h FROM signals WHERE id = ?", (row_id,)).fetchone())
+        self.assertAlmostEqual(row["out_1h"], 10.0)
+        self.assertAlmostEqual(row["price_1h"], 110.0,
+                               msg="абсолютная цена нужна для пересчёта любых метрик")
+
+    def test_alert_without_context_still_records(self):
+        signal = pump_bot.Signal(
+            exchange="BINANCE", symbol="ABCUSDT", triggers=["MAIN"], move_15m=7.0, move_5m=None,
+            zscore=5.0, vol_mult=4.5, price=1.0, volume_24h=2e7, funding_rate=None, ts=START_TS)
+        alert = pump_bot.Alert(symbol="ABCUSDT", exchanges=["BINANCE"], primary=signal,
+                               ts=START_TS)
+        row_id = self.journal.record(alert)
+        row = dict(self.journal.conn.execute(
+            "SELECT basis_pct, context_verdict, btc_mult FROM signals WHERE id = ?",
+            (row_id,)).fetchone())
+        self.assertIsNone(row["basis_pct"])
+        self.assertIsNone(row["context_verdict"])
+        self.assertAlmostEqual(row["btc_mult"], 1.0)
+
+
+class AlertSubtypeGovernanceTestCase(unittest.TestCase):
+    """EXHAUST — объявленный подтип Типа 1, а не самовольный новый тип сообщения."""
+
+    def setUp(self):
+        self.cfg = pump_bot.load_config(CONFIG_PATH)
+        self.bot = pump_bot.PumpBot(self.cfg)
+
+    def alert(self, kind):
+        signal = pump_bot.Signal(exchange="BINANCE", symbol="XYZUSDT", triggers=["MAIN"],
+                                 move_15m=9.0, move_5m=7.0, zscore=8.0, vol_mult=6.0,
+                                 price=1.0, volume_24h=5e7, funding_rate=None, ts=START_TS)
+        return pump_bot.Alert(symbol="XYZUSDT", exchanges=["BINANCE"], primary=signal,
+                              ts=START_TS, kind=kind)
+
+    def test_declared_subtypes_pass(self):
+        from context.publisher import PUMP_ALERT_SUBTYPES
+        self.assertEqual(set(PUMP_ALERT_SUBTYPES), {"PUMP", "EXHAUST"})
+        for kind in PUMP_ALERT_SUBTYPES:
+            allowed, reason = self.bot.alert_allowed(self.alert(kind))
+            self.assertTrue(allowed, f"{kind}: {reason}")
+
+    def test_undeclared_subtype_never_sent(self):
+        allowed, reason = self.bot.alert_allowed(self.alert("SOMETHING_NEW"))
+        self.assertFalse(allowed)
+        self.assertIn("не объявлен", reason)
+
+    def test_shadow_kind_is_not_sent_but_journaled(self):
+        cfg = pump_bot.load_config(CONFIG_PATH)
+        cfg["alerts"]["shadow_kinds"] = ["EXHAUST"]
+        bot = pump_bot.PumpBot(cfg)
+        allowed, reason = bot.alert_allowed(self.alert("EXHAUST"))
+        self.assertFalse(allowed)
+        self.assertIn("тени", reason)
+        self.assertTrue(bot.alert_allowed(self.alert("PUMP"))[0],
+                        "тень одного подтипа не глушит остальные")
+
+    def test_bot_emits_only_declared_kinds(self):
+        """Кода, создающего необъявленный подтип, быть не должно."""
+        import re
+        source = io.open(os.path.join(os.path.dirname(CONFIG_PATH), "pump_bot.py"),
+                         encoding="utf-8").read()
+        from context.publisher import PUMP_ALERT_SUBTYPES
+        kinds = set(re.findall(r'kind=["\']([A-Z_]+)["\']', source))
+        self.assertTrue(kinds <= set(PUMP_ALERT_SUBTYPES),
+                        f"необъявленные подтипы в коде: {kinds - set(PUMP_ALERT_SUBTYPES)}")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

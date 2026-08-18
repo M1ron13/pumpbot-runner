@@ -70,7 +70,9 @@
     "chart_url_template": "https://www.tradingview.com/chart/?symbol={exchange}%3A{symbol}.P",
     "volume_decimals": 1,
     "funding_decimals": 3,
-    "price_significant_digits": 6
+    "price_significant_digits": 6,
+    "shadow_kinds": [],
+    "_комментарий_подтипы": "Подтипы алерта объявлены в context/publisher.py: PUMP_ALERT_SUBTYPES. Новый подтип добавляется туда и сначала сюда, в shadow_kinds."
   },
   "logging": {
     "file": "pump_bot.log",

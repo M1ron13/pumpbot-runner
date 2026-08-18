@@ -33,6 +33,11 @@ try:
 except Exception:      # noqa: BLE001 — слой не обязателен, любая его проблема не наша
     _context_enrich = None
 
+try:
+    from context.publisher import PUMP_ALERT_SUBTYPES as _ALERT_SUBTYPES
+except Exception:      # noqa: BLE001
+    _ALERT_SUBTYPES = ("PUMP",)
+
 
 def now() -> float:
     """Единственный источник времени в боте.
@@ -427,6 +432,8 @@ class Alert:
     ts: float
     at_startup: bool = False   # найден на первом проходе после backfill
     kind: str = "PUMP"         # PUMP — рост, EXHAUST — истощение импульса
+    btc_mult: float = 1.0      # множитель порогов из фильтра режима рынка
+    context: dict = field(default_factory=dict)   # снимок контекста на момент алерта
 
     @property
     def is_fast(self) -> bool:
@@ -449,6 +456,7 @@ class Detector:
         self.states: Dict[str, SymbolState] = {}
         self.last_alert_ts: Dict[str, float] = {}
         self.startup_pass = False   # True на проходе сразу после backfill: алерт помечается
+        self._btc_mult_last = 1.0
         self.alert_history: deque = deque()
         self.binance_funding: Dict[str, float] = {}
 
@@ -627,6 +635,7 @@ class Detector:
         excluded = set(self.uni["exclude_symbols"])
 
         btc_mult = self.btc_multiplier()
+        self._btc_mult_last = btc_mult      # едет в журнал: это режим рынка на момент алерта
         signals: List[Signal] = []
 
         for key, state in self.states.items():
@@ -723,6 +732,7 @@ class Detector:
                 primary=primary,
                 ts=ts,
                 at_startup=self.startup_pass,
+                btc_mult=self._btc_mult_last,
             ))
 
         merged.sort(key=lambda a: a.primary.zscore, reverse=True)
@@ -1197,15 +1207,43 @@ class SignalJournal:
             funding REAL, volume_24h REAL,
             oi_read TEXT, oi_change_pct REAL,
             event_context TEXT, triggers TEXT, note TEXT,
+            -- контекст на момент алерта: без него исход нельзя объяснить,
+            -- а значит и проверить, какие условия дают предсказательную силу
+            btc_mult REAL, at_startup INTEGER, exchanges TEXT,
+            long_short_ratio REAL, taker_ratio REAL, oi_window_min INTEGER,
+            basis_pct REAL, basis_verdict TEXT,
+            krw_premium REAL, krw_background REAL, krw_excess REAL,
+            funding_state TEXT, funding_8h REAL,
+            dex_volume_h24 REAL, dex_price_change_h1 REAL, dex_pair TEXT,
+            context_verdict TEXT, context_sources_failed TEXT, context_block TEXT,
+            price_1h REAL, price_4h REAL, price_24h REAL,
             out_1h REAL, out_4h REAL, out_24h REAL
         )
     """
+
+    # Колонки, добавленные после первых записей: миграция без потери истории.
+    MIGRATIONS = (
+        ("btc_mult", "REAL"), ("at_startup", "INTEGER"), ("exchanges", "TEXT"),
+        ("long_short_ratio", "REAL"), ("taker_ratio", "REAL"), ("oi_window_min", "INTEGER"),
+        ("basis_pct", "REAL"), ("basis_verdict", "TEXT"),
+        ("krw_premium", "REAL"), ("krw_background", "REAL"), ("krw_excess", "REAL"),
+        ("funding_state", "TEXT"), ("funding_8h", "REAL"),
+        ("dex_volume_h24", "REAL"), ("dex_price_change_h1", "REAL"), ("dex_pair", "TEXT"),
+        ("context_verdict", "TEXT"), ("context_sources_failed", "TEXT"),
+        ("context_block", "TEXT"),
+        ("price_1h", "REAL"), ("price_4h", "REAL"), ("price_24h", "REAL"),
+    )
     HORIZONS = (("out_1h", 3600.0), ("out_4h", 14400.0), ("out_24h", 86400.0))
 
     def __init__(self, path: str):
         self.path = path
         self.conn = sqlite3.connect(path)
+        self.conn.row_factory = sqlite3.Row
         self.conn.execute(self.SCHEMA)
+        existing = {row[1] for row in self.conn.execute("PRAGMA table_info(signals)")}
+        for column, ddl in self.MIGRATIONS:
+            if column not in existing:
+                self.conn.execute(f"ALTER TABLE signals ADD COLUMN {column} {ddl}")
         self.conn.commit()
 
     def close(self) -> None:
@@ -1215,16 +1253,42 @@ class SignalJournal:
             pass
 
     def record(self, alert: "Alert") -> int:
+        """Полный снимок момента алерта — это заготовка бэктеста, а не лог отправки.
+
+        Проценты исхода без условий, при которых сигнал возник, ничего не проверяют:
+        нельзя отличить «сработало из-за перегруза шортов» от «сработало случайно».
+        """
         sig = alert.primary
+        context = alert.context or {}
+        derivatives = context.get("derivatives") or {}
+        dex = context.get("dex") or {}
+        funding_state = context.get("funding_state") or {}
         cur = self.conn.execute(
             """INSERT INTO signals (ts, iso, kind, exchange, symbol, price, move_15m,
                     move_5m, zscore, vol_mult, funding, volume_24h, oi_read,
-                    oi_change_pct, event_context, triggers, note)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    oi_change_pct, event_context, triggers, note,
+                    btc_mult, at_startup, exchanges,
+                    long_short_ratio, taker_ratio, oi_window_min,
+                    basis_pct, basis_verdict,
+                    krw_premium, krw_background, krw_excess,
+                    funding_state, funding_8h,
+                    dex_volume_h24, dex_price_change_h1, dex_pair,
+                    context_verdict, context_sources_failed, context_block)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                       ?,?,?, ?,?,?, ?,?, ?,?,?, ?,?, ?,?,?, ?,?,?)""",
             (alert.ts, datetime.fromtimestamp(alert.ts, tz=timezone.utc).isoformat(),
              alert.kind, sig.exchange, sig.symbol, sig.price, sig.move_15m, sig.move_5m,
              sig.zscore, sig.vol_mult, sig.funding_rate, sig.volume_24h, sig.oi_read,
-             sig.oi_change_pct, sig.event_context, "+".join(sig.triggers), sig.note),
+             sig.oi_change_pct, sig.event_context, "+".join(sig.triggers), sig.note,
+             alert.btc_mult, 1 if alert.at_startup else 0, ",".join(alert.exchanges),
+             derivatives.get("long_short_ratio"), derivatives.get("taker_buy_sell_ratio"),
+             derivatives.get("oi_window_min"),
+             context.get("basis_pct"), context.get("basis_verdict"),
+             context.get("krw_premium"), context.get("krw_background"), context.get("krw_excess"),
+             funding_state.get("state"), funding_state.get("value"),
+             dex.get("volume_h24"), dex.get("price_change_h1"), dex.get("pair"),
+             context.get("verdict"), ",".join(context.get("sources_failed") or []),
+             (context.get("block") or "")[:2000]),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -1247,7 +1311,10 @@ class SignalJournal:
         if not price_then:
             return
         change = (price_now - price_then) / price_then * 100.0
-        self.conn.execute(f"UPDATE signals SET {column} = ? WHERE id = ?", (change, row_id))
+        price_column = column.replace("out_", "price_")
+        self.conn.execute(
+            f"UPDATE signals SET {column} = ?, {price_column} = ? WHERE id = ?",
+            (change, price_now, row_id))
         self.conn.commit()
 
     def report(self) -> str:
@@ -1384,6 +1451,22 @@ class PumpBot:
         self.save_state(f"выход: {self.stop_reason}")
         log.info("остановлен (%s)", self.stop_reason)
 
+    def alert_allowed(self, alert: Alert) -> Tuple[bool, str]:
+        """Можно ли отправлять этот подтип алерта.
+
+        Подтипы объявлены в `context.publisher.PUMP_ALERT_SUBTYPES`: незаявленный вид
+        сообщения в канал не уходит вообще, а заявленный можно держать в тени через
+        `alerts.shadow_kinds` — тем же правилом, что действует для типов публикатора.
+        Запись в журнал исходов при этом сохраняется: наблюдение продолжается.
+        """
+        kind = (alert.kind or "PUMP").upper()
+        if kind not in {k.upper() for k in _ALERT_SUBTYPES}:
+            return False, f"подтип {kind} не объявлен в PUMP_ALERT_SUBTYPES"
+        shadow = {k.upper() for k in (self.cfg["alerts"].get("shadow_kinds") or [])}
+        if kind in shadow:
+            return False, f"подтип {kind} в режиме тени"
+        return True, ""
+
     async def context_block(self, alert: Alert) -> str:
         """Блок контекста от внешнего слоя. Пустая строка, если его нет или не успел.
 
@@ -1397,6 +1480,8 @@ class PumpBot:
         try:
             block = await asyncio.wait_for(_context_enrich(alert, self.cfg),
                                            timeout=limit_ms / 1000.0)
+            if block:
+                alert.context = {**(alert.context or {}), "block": block}
             return f"\n{block}" if block else ""
         except asyncio.TimeoutError:
             log.warning("контекст-слой не уложился в %.0f мс — алерт уходит без него", limit_ms)
@@ -1580,7 +1665,11 @@ class PumpBot:
                 sig.symbol, "+".join(alert.exchanges), "+".join(sig.triggers),
                 sig.move_15m, sig.zscore, sig.vol_mult,
             )
-            await telegram.send(render_alert(alert, self.cfg) + await self.context_block(alert))
+            allowed, reason = self.alert_allowed(alert)
+            if not allowed:
+                log.warning("алерт %s (%s) не отправлен: %s", sig.symbol, alert.kind, reason)
+            else:
+                await telegram.send(render_alert(alert, self.cfg) + await self.context_block(alert))
             if self.journal is not None:
                 try:
                     self.journal.record(alert)

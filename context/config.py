@@ -18,6 +18,8 @@ ENV_KEYS = {
     "groq": "GROQ_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "gemini": "GEMINI_API_KEY",
+    "telegram_api_id": "TELEGRAM_API_ID",
+    "telegram_api_hash": "TELEGRAM_API_HASH",
 }
 
 

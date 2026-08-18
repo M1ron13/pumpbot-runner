@@ -38,6 +38,12 @@ UNIVERSE_EVENT = "UNIVERSE_EVENT"
 MAJOR_NEWS = "MAJOR_NEWS"
 WHITELIST = (PUMP_ALERT, NEW_LISTING, UNIVERSE_EVENT, MAJOR_NEWS)
 
+# Подтипы Типа 1. Алерты детектора шлёт сам бот (ТЗ: «работает как сейчас, не трогать»),
+# но перечень подтипов обязан быть объявлен здесь же, иначе новый вид сообщения
+# появляется в канале, не проходя ни одного гейта — как это вышло с EXHAUST.
+# Добавление подтипа = правка этого кортежа + режим тени в alerts.shadow_kinds.
+PUMP_ALERT_SUBTYPES = ("PUMP", "EXHAUST")
+
 # Метки причин — по ним читаются ретро-таблица и лог.
 LABEL_KILL = "kill_switch"
 LABEL_NOT_WHITELISTED = "not_whitelisted"

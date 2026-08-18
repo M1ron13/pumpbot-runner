@@ -15,3 +15,6 @@ context_cache.db-wal
 context_cache.db-shm
 context_monitor.log
 .env
+telegram_session.session
+*.session
+*.session-journal
