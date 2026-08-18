@@ -14,6 +14,7 @@ import logging
 import math
 import os
 import signal
+import sqlite3
 import sys
 import time
 from collections import deque
@@ -255,6 +256,102 @@ def history_from_candles(
     return {"moves": moves, "vols": vols, "ticks": ticks, "first_ts": candles[0].ts}
 
 
+# --------------------------------------------------------------------------- #
+# слой 2: чтение открытого интереса
+# --------------------------------------------------------------------------- #
+
+def read_open_interest(oi_now: Optional[float], oi_past: Optional[float],
+                       threshold_pct: float) -> Tuple[str, Optional[float]]:
+    """Цена вверх — но на чьи деньги.
+
+    OI растёт вместе с ценой → в позицию заходят новые деньги, шортить опасно.
+    OI падает → это закрытие шортов (сквиз), импульс выдохнется сам.
+    """
+    if not oi_now or not oi_past or oi_past <= 0:
+        return "FLAT", None
+    change = (oi_now - oi_past) / oi_past * 100.0
+    if change > threshold_pct:
+        return "NEW_MONEY", change
+    if change < -threshold_pct:
+        return "SQUEEZE", change
+    return "FLAT", change
+
+
+OI_VERDICTS = {
+    "NEW_MONEY": "OI↑ новые деньги — шорт опасен",
+    "SQUEEZE": "OI↓ шорт-сквиз — импульс выдохнется",
+    "FLAT": "OI≈ без выраженного потока",
+}
+
+
+# --------------------------------------------------------------------------- #
+# слой 3: детектор истощения (второй алерт — момент входа в fade)
+# --------------------------------------------------------------------------- #
+
+def detect_exhaustion(candles: List[Candle], cfg: dict) -> Tuple[bool, str]:
+    """Новый максимум на затухающем объёме после импульса.
+
+    Работает по закрытым свечам: последняя свеча биржи ещё формируется,
+    её объём заведомо неполный и дал бы ложное «истощение» на каждом проходе.
+    """
+    ex = cfg["exhaustion"]
+    lookback = int(ex["lookback_candles"])
+    if len(candles) < lookback + 2:
+        return False, ""
+    window = candles[-(lookback + 1):-1]          # без незакрытой свечи
+    if len(window) < 3:
+        return False, ""
+    last = window[-1]
+    earlier = window[:-1]
+    impulse = max(earlier, key=lambda c: c.quote_volume)
+    if impulse.quote_volume <= 0:
+        return False, ""
+    prev_high = max(c.close for c in earlier)
+    new_high = last.close >= prev_high * float(ex["new_high_tolerance"])
+    decay = last.quote_volume / impulse.quote_volume
+    if new_high and decay < float(ex["volume_decay"]):
+        return True, f"новый хай на объёме {decay:.0%} от импульсного"
+    return False, ""
+
+
+# --------------------------------------------------------------------------- #
+# слой 1: контекст события (почему растёт)
+# --------------------------------------------------------------------------- #
+
+def base_coin(symbol: str, quote_suffix: str) -> str:
+    coin = symbol[: -len(quote_suffix)] if symbol.endswith(quote_suffix) else symbol
+    for prefix in ("1000000", "10000", "1000"):
+        if coin.startswith(prefix):
+            coin = coin[len(prefix):]
+            break
+    return coin
+
+
+def unlock_context(emissions: Optional[list], coin: str, window_days: float,
+                   now_ts: float) -> Optional[str]:
+    """Ближайший анлок токена по данным DefiLlama, если он рядом по времени."""
+    if not emissions:
+        return None
+    for project in emissions:
+        if not isinstance(project, dict):
+            continue
+        names = {str(project.get("token", "")).upper(), str(project.get("name", "")).upper()}
+        if coin.upper() not in names:
+            continue
+        best = None
+        for event in project.get("events") or []:
+            ts = event.get("timestamp")
+            if not ts:
+                continue
+            days = (float(ts) - now_ts) / 86400.0
+            if abs(days) <= window_days and (best is None or abs(days) < abs(best)):
+                best = days
+        if best is None:
+            return None
+        return f"анлок {'через' if best > 0 else 'был'} {abs(best):.1f} дн"
+    return None
+
+
 @dataclass
 class Signal:
     """Сработавший триггер по одной бирже (до дедупа)."""
@@ -269,6 +366,10 @@ class Signal:
     volume_24h: float
     funding_rate: Optional[float]
     ts: float
+    oi_read: str = "FLAT"
+    oi_change_pct: Optional[float] = None
+    event_context: str = ""
+    note: str = ""
 
 
 @dataclass
@@ -279,6 +380,7 @@ class Alert:
     primary: Signal
     ts: float
     at_startup: bool = False   # найден на первом проходе после backfill
+    kind: str = "PUMP"         # PUMP — рост, EXHAUST — истощение импульса
 
     @property
     def is_fast(self) -> bool:
@@ -612,7 +714,10 @@ def render_alert(alert: Alert, cfg: dict) -> str:
     chart = al["chart_url_template"].format(exchange=sig.exchange, symbol=sig.symbol)
     clock = datetime.fromtimestamp(alert.ts, tz=timezone.utc).strftime("%H:%M:%S")
 
-    lines = [f"🔴 <b>PUMP: {base}/{quote}</b> [{exchanges}]"]
+    icon = "🎯" if alert.kind == "EXHAUST" else "🔴"
+    lines = [f"{icon} <b>{alert.kind}: {base}/{quote}</b> [{exchanges}]"]
+    if alert.kind == "EXHAUST":
+        lines.append(f"⚡ <b>истощение импульса — момент для fade</b>")
     if alert.at_startup:
         lines.append("⏱ обнаружен при старте")
     if alert.is_fast and sig.move_5m is not None:
@@ -627,6 +732,14 @@ def render_alert(alert: Alert, cfg: dict) -> str:
         f" | 24h Vol: {fmt_volume(sig.volume_24h, al['volume_decimals'])}"
     )
     lines.append(f"💸 Funding: {fmt_funding(sig.funding_rate, al['funding_decimals'])}")
+    oi_line = OI_VERDICTS.get(sig.oi_read, OI_VERDICTS["FLAT"])
+    if sig.oi_change_pct is not None:
+        oi_line += f" ({sig.oi_change_pct:+.1f}%)"
+    lines.append(f"🧭 {oi_line}")
+    if sig.event_context:
+        lines.append(f"📰 {sig.event_context}")
+    if sig.note:
+        lines.append(f"📝 {sig.note}")
     lines.append(f"🕐 {clock} UTC")
     lines.append(f"📊 График (ссылка: {chart})")
     return "\n".join(lines)
@@ -760,12 +873,93 @@ class Feed:
         out.sort(key=lambda c: c.ts)
         return out or None
 
+    async def candles_15m(self, exchange: str, symbol: str, limit: int) -> Optional[List[Candle]]:
+        """15-минутные свечи — для детектора истощения."""
+        if exchange == "BINANCE":
+            url = self.net["binance_klines_15m_url"].format(symbol=symbol, limit=limit)
+            data = await self.get_json("binance/klines15m", url)
+            if not isinstance(data, list):
+                return None
+            out = []
+            for item in data:
+                try:
+                    out.append(Candle(float(item[0]) / 1000.0, float(item[4]), float(item[7])))
+                except (IndexError, TypeError, ValueError):
+                    continue
+            return out or None
+        url = self.net["bybit_klines_15m_url"].format(symbol=symbol, limit=limit)
+        data = await self.get_json("bybit/klines15m", url)
+        rows = (data or {}).get("result", {}).get("list") if isinstance(data, dict) else None
+        if not rows:
+            return None
+        out = []
+        for item in rows:
+            try:
+                out.append(Candle(float(item[0]) / 1000.0, float(item[4]), float(item[6])))
+            except (IndexError, TypeError, ValueError):
+                continue
+        out.sort(key=lambda c: c.ts)
+        return out or None
+
     async def candles(self, exchange: str, symbol: str, limit: int) -> Optional[List[Candle]]:
         if exchange == "BINANCE":
             return await self.binance_klines(symbol, min(limit, self.net["binance_klines_max"]))
         if exchange == "BYBIT":
             return await self.bybit_klines(symbol, min(limit, self.net["bybit_klines_max"]))
         return None
+
+    async def binance_open_interest(self, symbol: str, period: str, limit: int
+                                    ) -> Tuple[Optional[float], Optional[float]]:
+        """Текущий OI и OI в начале окна — из истории, одним запросом."""
+        url = self.net["binance_oi_hist_url"].format(symbol=symbol, period=period, limit=limit)
+        data = await self.get_json("binance/openInterestHist", url)
+        if not isinstance(data, list) or not data:
+            return None, None
+        try:
+            rows = sorted(data, key=lambda item: float(item["timestamp"]))
+            return float(rows[-1]["sumOpenInterest"]), float(rows[0]["sumOpenInterest"])
+        except (KeyError, TypeError, ValueError):
+            return None, None
+
+    async def bybit_open_interest(self, symbol: str, interval: str, limit: int
+                                  ) -> Tuple[Optional[float], Optional[float]]:
+        url = self.net["bybit_oi_hist_url"].format(symbol=symbol, interval=interval, limit=limit)
+        data = await self.get_json("bybit/open-interest", url)
+        rows = (data or {}).get("result", {}).get("list") if isinstance(data, dict) else None
+        if not rows:
+            return None, None
+        try:
+            ordered = sorted(rows, key=lambda item: float(item["timestamp"]))
+            return float(ordered[-1]["openInterest"]), float(ordered[0]["openInterest"])
+        except (KeyError, TypeError, ValueError):
+            return None, None
+
+    async def open_interest(self, exchange: str, symbol: str, cfg: dict
+                            ) -> Tuple[Optional[float], Optional[float]]:
+        oi_cfg = cfg["open_interest"]
+        if exchange == "BINANCE":
+            return await self.binance_open_interest(symbol, oi_cfg["binance_period"], oi_cfg["points"])
+        if exchange == "BYBIT":
+            return await self.bybit_open_interest(symbol, oi_cfg["bybit_interval"], oi_cfg["points"])
+        return None, None
+
+    async def price(self, exchange: str, symbol: str) -> Optional[float]:
+        """Текущая цена одного символа — для дозаписи исходов сигналов."""
+        if exchange == "BINANCE":
+            data = await self.get_json("binance/price", self.net["binance_price_url"].format(symbol=symbol))
+            try:
+                return float(data["price"])
+            except (KeyError, TypeError, ValueError):
+                return None
+        data = await self.get_json("bybit/price", self.net["bybit_price_url"].format(symbol=symbol))
+        try:
+            return float(data["result"]["list"][0]["lastPrice"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None
+
+    async def llama_emissions(self) -> Optional[list]:
+        data = await self.get_json("llama/emissions", self.net["llama_emissions_url"])
+        return data if isinstance(data, list) else None
 
     async def binance_funding(self) -> Dict[str, float]:
         data = await self.get_json("binance/premiumIndex", self.net["binance_premium_index_url"])
@@ -928,6 +1122,100 @@ def write_state_file(path: str, data: dict) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# слой 5: журнал сигналов и исходов (+1ч / +4ч / +24ч)
+# --------------------------------------------------------------------------- #
+
+class SignalJournal:
+    """SQLite-журнал: каждый алерт и что с ценой стало через 1, 4 и 24 часа.
+
+    Каждый горизонт замеряется в своё время (по достижении возраста), а не
+    задним числом одним значением — иначе накопленный датасет описывает не
+    исход сигнала, а момент, когда до него дошли руки.
+    """
+
+    SCHEMA = """
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            iso TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            price REAL NOT NULL,
+            move_15m REAL, move_5m REAL, zscore REAL, vol_mult REAL,
+            funding REAL, volume_24h REAL,
+            oi_read TEXT, oi_change_pct REAL,
+            event_context TEXT, triggers TEXT, note TEXT,
+            out_1h REAL, out_4h REAL, out_24h REAL
+        )
+    """
+    HORIZONS = (("out_1h", 3600.0), ("out_4h", 14400.0), ("out_24h", 86400.0))
+
+    def __init__(self, path: str):
+        self.path = path
+        self.conn = sqlite3.connect(path)
+        self.conn.execute(self.SCHEMA)
+        self.conn.commit()
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def record(self, alert: "Alert") -> int:
+        sig = alert.primary
+        cur = self.conn.execute(
+            """INSERT INTO signals (ts, iso, kind, exchange, symbol, price, move_15m,
+                    move_5m, zscore, vol_mult, funding, volume_24h, oi_read,
+                    oi_change_pct, event_context, triggers, note)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (alert.ts, datetime.fromtimestamp(alert.ts, tz=timezone.utc).isoformat(),
+             alert.kind, sig.exchange, sig.symbol, sig.price, sig.move_15m, sig.move_5m,
+             sig.zscore, sig.vol_mult, sig.funding_rate, sig.volume_24h, sig.oi_read,
+             sig.oi_change_pct, sig.event_context, "+".join(sig.triggers), sig.note),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def pending(self, ts: float) -> List[Tuple[int, str, str, float, str]]:
+        """Сигналы, у которых подошёл срок замера очередного горизонта."""
+        rows = self.conn.execute(
+            "SELECT id, exchange, symbol, price, ts, out_1h, out_4h, out_24h "
+            "FROM signals WHERE out_24h IS NULL"
+        ).fetchall()
+        due = []
+        for rid, exchange, symbol, price, signal_ts, o1, o4, o24 in rows:
+            age = ts - signal_ts
+            for (column, horizon), value in zip(self.HORIZONS, (o1, o4, o24)):
+                if value is None and age >= horizon:
+                    due.append((rid, exchange, symbol, price, column))
+        return due
+
+    def fill(self, row_id: int, column: str, price_now: float, price_then: float) -> None:
+        if not price_then:
+            return
+        change = (price_now - price_then) / price_then * 100.0
+        self.conn.execute(f"UPDATE signals SET {column} = ? WHERE id = ?", (change, row_id))
+        self.conn.commit()
+
+    def report(self) -> str:
+        rows = self.conn.execute(
+            """SELECT kind, COALESCE(oi_read, 'FLAT'), COUNT(*),
+                      AVG(out_1h), AVG(out_4h), AVG(out_24h),
+                      SUM(CASE WHEN out_24h < 0 THEN 1 ELSE 0 END)
+               FROM signals GROUP BY kind, oi_read ORDER BY kind, oi_read"""
+        ).fetchall()
+        lines = [f"{'ТИП':9}{'OI':11}{'N':>4}{'ср.1ч%':>9}{'ср.4ч%':>9}{'ср.24ч%':>9}{'ушло вниз':>11}"]
+        for kind, oi, count, a1, a4, a24, down in rows:
+            def num(v):
+                return f"{v:>9.2f}" if v is not None else f"{'—':>9}"
+            share = f"{(down or 0) / count:.0%}" if count else "—"
+            lines.append(f"{kind:9}{oi:11}{count:>4}{num(a1)}{num(a4)}{num(a24)}{share:>11}")
+        return chr(10).join(lines)
+
+
+# --------------------------------------------------------------------------- #
 # бот
 # --------------------------------------------------------------------------- #
 
@@ -945,6 +1233,17 @@ class PumpBot:
         self._restored = 0
         self._last_data_ts = 0.0
         self._backfill_stats = {}
+        self._emissions = None
+        self._emissions_ts = 0.0
+        self._watching: Dict[str, dict] = {}   # символы под наблюдением на истощение
+        self._last_outcome_ts = 0.0
+        self.journal: Optional[SignalJournal] = None
+        journal_path = cfg.get("journal", {}).get("db_file")
+        if journal_path:
+            try:
+                self.journal = SignalJournal(journal_path)
+            except Exception as exc:
+                log.error("журнал сигналов недоступен (%s): %s", journal_path, exc)
 
     def request_stop(self, reason: str = "сигнал") -> None:
         if not self.stopping:
@@ -1033,6 +1332,92 @@ class PumpBot:
         self.save_state(f"выход: {self.stop_reason}")
         log.info("остановлен (%s)", self.stop_reason)
 
+    async def enrich(self, alert: Alert, feed: Feed) -> None:
+        """Слои 1-2: чем дышит импульс (OI) и есть ли у него причина (событие)."""
+        sig = alert.primary
+        if self.cfg["open_interest"]["enabled"]:
+            try:
+                oi_now, oi_past = await feed.open_interest(sig.exchange, sig.symbol, self.cfg)
+                sig.oi_read, sig.oi_change_pct = read_open_interest(
+                    oi_now, oi_past, self.cfg["open_interest"]["threshold_pct"])
+            except Exception as exc:
+                log.warning("OI по %s не получен: %s", sig.symbol, exc)
+        if self.cfg["event_context"]["enabled"]:
+            try:
+                sig.event_context = await self.event_context(sig.symbol, feed) or ""
+            except Exception as exc:
+                log.warning("контекст события по %s не получен: %s", sig.symbol, exc)
+
+    async def event_context(self, symbol: str, feed: Feed) -> Optional[str]:
+        """Анлоки DefiLlama. Список тянется раз в час на весь бот, а не на каждый символ."""
+        ctx_cfg = self.cfg["event_context"]
+        if now() - self._emissions_ts >= ctx_cfg["refresh_sec"]:
+            self._emissions = await feed.llama_emissions()
+            self._emissions_ts = now()
+        coin = base_coin(symbol, self.cfg["universe"]["quote_suffix"])
+        return unlock_context(self._emissions, coin, ctx_cfg["unlock_window_days"], now())
+
+    async def check_exhaustion(self, feed: Feed) -> List[Alert]:
+        """Слой 3: второй алерт — импульс выдохся, вот момент для fade."""
+        ex_cfg = self.cfg["exhaustion"]
+        if not ex_cfg["enabled"] or not self._watching:
+            return []
+        out: List[Alert] = []
+        window_sec = ex_cfg["watch_hours"] * 3600.0
+        for key, watch in list(self._watching.items()):
+            if now() - watch["since"] > window_sec:
+                del self._watching[key]
+                continue
+            if watch["alerted"] or now() - watch["since"] < ex_cfg["min_wait_sec"]:
+                continue
+            candles = await feed.candles_15m(watch["exchange"], watch["symbol"],
+                                             ex_cfg["lookback_candles"] + 2)
+            if not candles:
+                continue
+            ok, note = detect_exhaustion(candles, self.cfg)
+            if not ok:
+                continue
+            state = self.detector.states.get(key)
+            last = state.last if state else None
+            move_15m = state.move_pct(self.cfg["detection"]["window_main_sec"]) if state else None
+            signal = Signal(
+                exchange=watch["exchange"], symbol=watch["symbol"], triggers=["EXHAUST"],
+                move_15m=move_15m if move_15m is not None else 0.0,
+                move_5m=state.move_pct(self.cfg["detection"]["window_fast_sec"]) if state else None,
+                zscore=0.0, vol_mult=0.0,
+                price=last[1] if last else candles[-1].close,
+                volume_24h=last[2] if last else 0.0,
+                funding_rate=state.funding_rate if state else None,
+                ts=now(), note=note,
+            )
+            alert = Alert(symbol=watch["symbol"], exchanges=[watch["exchange"]],
+                          primary=signal, ts=now(), kind="EXHAUST")
+            await self.enrich(alert, feed)
+            watch["alerted"] = True
+            out.append(alert)
+            log.info("ИСТОЩЕНИЕ %s [%s]: %s", watch["symbol"], watch["exchange"], note)
+        return out
+
+    async def update_outcomes(self, feed: Feed) -> None:
+        """Слой 5: дозапись исходов, каждый горизонт замеряется в своё время."""
+        if self.journal is None:
+            return
+        if now() - self._last_outcome_ts < self.cfg["journal"]["outcome_check_sec"]:
+            return
+        self._last_outcome_ts = now()
+        try:
+            due = self.journal.pending(now())
+        except Exception as exc:
+            log.error("журнал не опрошен: %s", exc)
+            return
+        for row_id, exchange, symbol, price_then, column in due:
+            price_now = await feed.price(exchange, symbol)
+            if price_now is None:
+                continue
+            self.journal.fill(row_id, column, price_now, price_then)
+            log.info("исход %s %s: %s = %+.2f%%", exchange, symbol, column,
+                     (price_now - price_then) / price_then * 100.0)
+
     def startup_message(self) -> str:
         cfg = self.cfg
         where = os.environ.get("PUMPBOT_RUNTIME_LABEL", "локально")
@@ -1093,6 +1478,13 @@ class PumpBot:
         alerts = self.detector.step(snapshots)
         self.detector.startup_pass = False
         for alert in alerts:
+            await self.enrich(alert, feed)
+            key = self.detector.key(alert.primary.exchange, alert.primary.symbol)
+            self._watching[key] = {"since": now(), "symbol": alert.primary.symbol,
+                                   "exchange": alert.primary.exchange, "alerted": False}
+        alerts.extend(await self.check_exhaustion(feed))
+        await self.update_outcomes(feed)
+        for alert in alerts:
             sig = alert.primary
             log.info(
                 "АЛЕРТ %s [%s] %s: %.2f%%/15м z=%.2f vol=%.2fx",
@@ -1100,15 +1492,45 @@ class PumpBot:
                 sig.move_15m, sig.zscore, sig.vol_mult,
             )
             await telegram.send(render_alert(alert, self.cfg))
+            if self.journal is not None:
+                try:
+                    self.journal.record(alert)
+                except Exception as exc:
+                    log.error("сигнал не записан в журнал: %s", exc)
+
+
+async def run_outcomes_once(cfg: dict) -> None:
+    """Разовая дозапись исходов — можно вешать в планировщик отдельно от бота."""
+    import aiohttp
+    bot = PumpBot(cfg)
+    if bot.journal is None:
+        log.error("журнал не настроен: заполни journal.db_file в config.json")
+        return
+    async with aiohttp.ClientSession() as session:
+        bot._last_outcome_ts = 0.0
+        await bot.update_outcomes(Feed(cfg, session))
+    bot.journal.close()
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Pump Detector Bot")
+    parser.add_argument("mode", nargs="?", default="run", choices=("run", "outcomes", "report"),
+                        help="run — бот; outcomes — дозаписать исходы; report — сводка по журналу")
     parser.add_argument("--config", default=CONFIG_DEFAULT_PATH, help="путь к config.json")
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
     setup_logging(cfg)
+
+    if args.mode == "report":
+        journal = SignalJournal(cfg["journal"]["db_file"])
+        print(journal.report())
+        journal.close()
+        return 0
+    if args.mode == "outcomes":
+        asyncio.run(run_outcomes_once(cfg))
+        return 0
+
     bot = PumpBot(cfg)
 
     loop = asyncio.new_event_loop()
