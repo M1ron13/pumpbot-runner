@@ -90,6 +90,28 @@ CREATE TABLE IF NOT EXISTS enrichments (
     sources_failed TEXT
 );
 
+CREATE TABLE IF NOT EXISTS published (
+    source TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    message_type TEXT,
+    ticker TEXT,
+    reserved_at REAL,
+    sent_at REAL,
+    PRIMARY KEY (source, external_id)
+);
+
+CREATE TABLE IF NOT EXISTS publish_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    message_type TEXT,
+    ticker TEXT,
+    source TEXT,
+    external_id TEXT,
+    label TEXT,
+    text TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_publish_log_ts ON publish_log(ts);
+
 CREATE TABLE IF NOT EXISTS sent_messages (
     hash TEXT PRIMARY KEY,
     ts REAL NOT NULL,
@@ -277,6 +299,61 @@ class Cache:
              kwargs.get("block"), kwargs.get("budget_ms"), kwargs.get("elapsed_ms"),
              ",".join(kwargs.get("sources_ok") or []), ",".join(kwargs.get("sources_failed") or [])))
         self.conn.commit()
+
+    # -- сквозной дедуп отправок ---------------------------------------------- #
+
+    def reserve_published(self, source: str, external_id: str, message_type: str = None,
+                          ticker: str = None, now_ts: float = None) -> bool:
+        """Занять ключ (source, external_id). False — по нему уже отправляли.
+
+        Ключ бронируется ДО отправки: даже если два процесса дошли до отправки
+        одновременно, второй получит False. Не отправилось — бронь снимается.
+        """
+        try:
+            self.conn.execute(
+                "INSERT INTO published (source, external_id, message_type, ticker, reserved_at)"
+                " VALUES (?,?,?,?,?)",
+                (source, external_id, message_type, ticker,
+                 now_ts if now_ts is not None else time.time()))
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def release_published(self, source: str, external_id: str) -> None:
+        """Снять бронь: отправка не состоялась (тень, лимит, ошибка сети)."""
+        self.conn.execute(
+            "DELETE FROM published WHERE source = ? AND external_id = ? AND sent_at IS NULL",
+            (source, external_id))
+        self.conn.commit()
+
+    def mark_published_sent(self, source: str, external_id: str, now_ts: float = None) -> None:
+        self.conn.execute(
+            "UPDATE published SET sent_at = ? WHERE source = ? AND external_id = ?",
+            (now_ts if now_ts is not None else time.time(), source, external_id))
+        self.conn.commit()
+
+    def published_count(self, since_ts: float, message_type: str = None) -> int:
+        sql = "SELECT COUNT(*) AS n FROM published WHERE sent_at >= ?"
+        params = [since_ts]
+        if message_type:
+            sql += " AND message_type = ?"
+            params.append(message_type)
+        return int(self.conn.execute(sql, params).fetchone()["n"] or 0)
+
+    def log_publish_decision(self, **kwargs) -> None:
+        self.conn.execute(
+            "INSERT INTO publish_log (ts, message_type, ticker, source, external_id, label, text)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (kwargs.get("ts", time.time()), kwargs.get("message_type"), kwargs.get("ticker"),
+             kwargs.get("source"), kwargs.get("external_id"), kwargs.get("label"),
+             (kwargs.get("text") or "")[:1000]))
+        self.conn.commit()
+
+    def publish_log_tail(self, limit: int = 100) -> list:
+        rows = self.conn.execute(
+            "SELECT * FROM publish_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
 
     # -- журнал отправленных сообщений ---------------------------------------- #
 

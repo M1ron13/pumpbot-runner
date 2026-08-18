@@ -157,6 +157,8 @@
       "equity x-perp",
       "equity perp",
       "x-perps",
+      "equity",
+      "stock",
       "equities",
       "tokenized stock",
       "tokenized equit",
@@ -230,17 +232,19 @@
     ]
   },
   "publisher": {
-    "_комментарий": "Единственная точка отправки событий в канал. Лимиты и выключатель — защита от повторения инцидента.",
+    "_комментарий": "Белый список: отправить можно только перечисленные типы. Новый тип или новый источник добавляется ТОЛЬКО с режимом тени, снимается вручную после просмотра ретро-таблицы владельцем.",
     "enabled": false,
-    "shadow_sources": [],
+    "shadow_types": [
+      "MAJOR_NEWS"
+    ],
     "max_per_hour": 6,
     "max_per_day": 20,
-    "post_event_types": [
-      "LISTING",
-      "DELISTING",
-      "PERP_LAUNCH",
-      "NEW_INSTRUMENT",
-      "HACK"
-    ]
+    "major_news": {
+      "max_source_tier": 2,
+      "min_confidence": 0.8,
+      "min_confirmations": 2,
+      "max_per_day": 5,
+      "over_limit_min_confidence": 0.9
+    }
   }
 }

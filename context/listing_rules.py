@@ -222,9 +222,12 @@ def decide(*, event_type: str, exchange: str, ticker: Optional[str], market: Opt
         return {"class": REJECTED, "post": False,
                 "reason": "тикер не распознан — событие непригодно для проверки"}
 
-    # монета, которой нет на биржах, где мы торгуем, нам недоступна — постить нечего.
-    # Исключение: листинг на нашей бирже как раз и вводит монету в universe.
-    if places is not None and not places and exchange not in tradable:
+    # Монета вне бирж, где мы торгуем, недоступна — событие по ней публиковать нечего.
+    # Листинги сюда не попадают: листинг на крупной площадке монеты, которой нигде не
+    # было, и есть тот самый сигнал «новая аудитория» (Тип 2 белого списка).
+    listing_types = ("LISTING", "NEW_INSTRUMENT", "PERP_LAUNCH", "FUTURES")
+    if (event_type not in listing_types and places is not None and not places
+            and exchange not in tradable):
         return {"class": OUT_OF_UNIVERSE, "post": False,
                 "reason": f"монеты нет на {', '.join(sorted(tradable))} — вне нашей вселенной"}
 

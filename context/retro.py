@@ -1,20 +1,19 @@
-"""Ретро-прогон: что решит публикатор по свежим и уже накопленным объявлениям.
+"""Ретро-прогон: что публикатор решил бы по объявлениям, ничего не отправляя.
 
-Ничего не отправляет и кэш не меняет. Нужен как приёмка перед включением канала:
-таблица «заголовок → тикер → фильтр/класс → решение» показывает не намерение
-правил, а их фактический вывод на реальных данных.
+Приёмка перед включением канала. Таблица «заголовок → тип → метка → решение»
+показывает не намерение правил, а их фактический вывод на реальных данных.
+Отправки не происходит: сообщения только собираются и проходят guard-цепочку до
+последнего шага.
 
-Запуск: python -m context.retro [--limit 100]
+Запуск: python -m context.retro [--limit 100] [--no-cache]
 """
 
 import argparse
 import asyncio
-import os
 import sys
 import time
 
 from context import config as ctx_config
-from context import listing_rules as rules
 from context.cache import Cache
 from context.publisher import Publisher
 from context.sources import announcements
@@ -52,24 +51,36 @@ def from_cache(cache, limit):
              "title": r["title"], "url": r["url"], "raw_type": None} for r in rows]
 
 
-def decide_row(item, cfg, cache, publisher, now_ts):
-    """Полный путь одного объявления: входной фильтр → тикер → матрица → решение."""
+def decide_row(item, cfg, publisher, now_ts):
+    """Путь объявления: входной фильтр → тикер → белый список → guard-цепочка.
+
+    До самой отправки дело не доходит: собранное сообщение и метка причины —
+    это и есть ответ на вопрос «что ушло бы в канал».
+    """
     screened = announcements.screen(item, cfg)
     if not screened["keep"]:
-        return {"stage": screened["stage"], "ticker": "—", "class": "—", "post": False,
-                "reason": screened["reason"]}
+        return {"type": "—", "ticker": "—", "label": screened["stage"], "post": False,
+                "text": None}
+
     ticker = item.get("ticker") or screened["tickers"][0]
-    event = {**item, "ticker": ticker}
-    outcome = publisher.evaluate(event, now_ts)
-    verdict = outcome["verdict"]
-    return {"stage": "оценено", "ticker": ticker, "class": verdict["class"],
-            "post": bool(outcome["blocked"] is None), "reason": verdict["reason"],
-            "blocked": outcome["blocked"]}
+    message, label = publisher.message_for({**item, "ticker": ticker}, now_ts)
+    if message is None:
+        return {"type": "—", "ticker": ticker, "label": label, "post": False, "text": None}
+
+    # сообщение собрано — проверяем остаток guard-цепочки, кроме собственно отправки
+    if message.requires_universe and not publisher.in_universe(message.ticker)[0]:
+        return {"type": message.type, "ticker": ticker, "label": "out_of_universe",
+                "post": False, "text": None}
+    if publisher.shadow(message.type):
+        return {"type": message.type, "ticker": ticker, "label": "would_send (тень)",
+                "post": False, "text": message.text}
+    return {"type": message.type, "ticker": ticker, "label": "would_send",
+            "post": True, "text": message.text}
 
 
 async def main_async(limit: int, use_cache: bool) -> int:
     cfg = ctx_config.load()
-    cfg["publisher"] = {**cfg["publisher"], "enabled": True}   # приёмка считает как при включённом канале
+    cfg["publisher"] = {**cfg["publisher"], "enabled": True}   # считаем как при включённом канале
     cache = Cache(ctx_config.cache_path(cfg))
     publisher = Publisher(cfg, cache, sender=None)
     now_ts = time.time()
@@ -83,30 +94,32 @@ async def main_async(limit: int, use_cache: bool) -> int:
 
     rows = []
     for item in items[: limit * 2]:
-        rows.append({**decide_row(item, cfg, cache, publisher, now_ts),
+        rows.append({**decide_row(item, cfg, publisher, now_ts),
                      "source": item.get("source"), "title": item.get("title")})
 
-    print(f"\n{'ИСТОЧНИК':9}{'ЗАГОЛОВОК':58}{'ТИКЕР':10}{'КЛАСС/ЭТАП':18}{'РЕШЕНИЕ':8}")
-    print("─" * 103)
+    print(f"\n{'ИСТОЧНИК':9}{'ЗАГОЛОВОК':56}{'ТИКЕР':9}{'ТИП':15}{'МЕТКА':20}{'РЕШЕНИЕ':8}")
+    print("─" * 110)
     for row in rows:
-        stage = row["class"] if row["stage"] == "оценено" else row["stage"]
-        print(f"{cut(row['source'], 8):9}{cut(row['title'], 57):58}{cut(row['ticker'], 9):10}"
-              f"{cut(stage, 17):18}{'КАНАЛ' if row['post'] else 'лог':8}")
+        print(f"{cut(row['source'], 8):9}{cut(row['title'], 55):56}{cut(row['ticker'], 8):9}"
+              f"{cut(row['type'], 14):15}{cut(row['label'], 19):20}"
+              f"{'КАНАЛ' if row['post'] else 'лог':8}")
 
-    print("─" * 103)
+    print("─" * 110)
     print(f"всего: {len(rows)}")
     buckets = {}
     for row in rows:
-        key = row["class"] if row["stage"] == "оценено" else row["stage"]
-        buckets[key] = buckets.get(key, 0) + 1
+        buckets[row["label"]] = buckets.get(row["label"], 0) + 1
     for key, count in sorted(buckets.items(), key=lambda kv: -kv[1]):
-        print(f"   {key:18} {count}")
+        print(f"   {key:22} {count}")
 
     to_channel = [r for r in rows if r["post"]]
-    print(f"\nПРОХОДЯТ В КАНАЛ: {len(to_channel)}")
-    for row in to_channel:
-        print(f"   [{row['source']}] {row['class']} {row['ticker']} — {row['reason']}")
-        print(f"      {cut(row['title'], 92)}")
+    shadowed = [r for r in rows if str(r["label"]).startswith("would_send (тень)")]
+    print(f"\nУШЛО БЫ В КАНАЛ: {len(to_channel)} | ПРИДЕРЖАНО ТЕНЬЮ: {len(shadowed)}")
+    for row in to_channel + shadowed:
+        print(f"\n   [{row['source']}] {row['type']} {row['ticker']} — {row['label']}")
+        print(f"   заголовок источника: {cut(row['title'], 84)}")
+        for line in (row.get("text") or "").splitlines():
+            print(f"   | {line}")
     cache.close()
     return 0
 
