@@ -7,3 +7,6 @@ __pycache__/
 *.pyc
 .venv/
 gas/Config.gs
+.cache/
+backtest_run.log
+backtest.xlsx
