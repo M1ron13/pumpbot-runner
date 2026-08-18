@@ -327,29 +327,68 @@ def base_coin(symbol: str, quote_suffix: str) -> str:
     return coin
 
 
-def unlock_context(emissions: Optional[list], coin: str, window_days: float,
-                   now_ts: float) -> Optional[str]:
-    """Ближайший анлок токена по данным DefiLlama, если он рядом по времени."""
-    if not emissions:
+def normalize_slug(slug: str) -> str:
+    """Слаг протокола → предполагаемый тикер: «frax-finance» → FRAX."""
+    cleaned = slug
+    for tail in ("-finance", "-network", "-protocol", "-labs", "-dao"):
+        cleaned = cleaned.replace(tail, "")
+    return cleaned.replace("-", "").upper()
+
+
+def build_slug_map(slugs: Optional[list], overrides: dict) -> Dict[str, str]:
+    """Карта «тикер → слаг»: сначала ручные соответствия, потом нормализация."""
+    mapping: Dict[str, str] = {}
+    for slug in slugs or []:
+        if not isinstance(slug, str):
+            continue
+        ticker = overrides.get(slug) or normalize_slug(slug)
+        mapping.setdefault(ticker, slug)
+    for slug, ticker in overrides.items():
+        mapping[ticker] = slug
+    return mapping
+
+
+def unlock_context(dataset: Optional[dict], window_days: float, now_ts: float) -> Optional[str]:
+    """Ближайший анлок из датасета DefiLlama: срок, доля supply, получатель.
+
+    Формат — датасет-хост `defillama-datasets.llama.fi/emissions/{слаг}`:
+    свободный доступ, тогда как api.llama.fi/emissions с 2026 отвечает HTTP 402.
+    """
+    if not isinstance(dataset, dict):
         return None
-    for project in emissions:
-        if not isinstance(project, dict):
+    meta = dataset.get("metadata") or {}
+    max_supply = (dataset.get("supplyMetrics") or {}).get("maxSupply") or meta.get("total")
+    best = None
+    for event in meta.get("events") or []:
+        if not isinstance(event, dict):
             continue
-        names = {str(project.get("token", "")).upper(), str(project.get("name", "")).upper()}
-        if coin.upper() not in names:
+        ts = event.get("timestamp")
+        if not ts:
             continue
-        best = None
-        for event in project.get("events") or []:
-            ts = event.get("timestamp")
-            if not ts:
-                continue
+        try:
             days = (float(ts) - now_ts) / 86400.0
-            if abs(days) <= window_days and (best is None or abs(days) < abs(best)):
-                best = days
-        if best is None:
-            return None
-        return f"анлок {'через' if best > 0 else 'был'} {abs(best):.1f} дн"
-    return None
+        except (TypeError, ValueError):
+            continue
+        if abs(days) > window_days:
+            continue
+        if best is None or abs(days) < abs(best[0]):
+            best = (days, event)
+    if best is None:
+        return None
+
+    days, event = best
+    parts = [f"анлок {'через' if days > 0 else 'был'} {abs(days):.1f} дн"]
+    tokens = [t for t in (event.get("noOfTokens") or []) if isinstance(t, (int, float))]
+    if tokens and max_supply:
+        try:
+            share = sum(tokens) / float(max_supply) * 100.0
+            parts.append(f"{share:.2f}% supply")
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    recipient = event.get("category")
+    if recipient:
+        parts.append(str(recipient))
+    return " · ".join(parts)
 
 
 @dataclass
@@ -957,9 +996,14 @@ class Feed:
         except (KeyError, IndexError, TypeError, ValueError):
             return None
 
-    async def llama_emissions(self) -> Optional[list]:
-        data = await self.get_json("llama/emissions", self.net["llama_emissions_url"])
+    async def llama_protocols(self) -> Optional[list]:
+        data = await self.get_json("llama/protocols", self.net["llama_protocols_url"])
         return data if isinstance(data, list) else None
+
+    async def llama_unlock_dataset(self, slug: str) -> Optional[dict]:
+        url = self.net["llama_dataset_url"].format(slug=slug)
+        data = await self.get_json(f"llama/{slug}", url)
+        return data if isinstance(data, dict) else None
 
     async def binance_funding(self) -> Dict[str, float]:
         data = await self.get_json("binance/premiumIndex", self.net["binance_premium_index_url"])
@@ -1233,7 +1277,8 @@ class PumpBot:
         self._restored = 0
         self._last_data_ts = 0.0
         self._backfill_stats = {}
-        self._emissions = None
+        self._slug_map: Dict[str, str] = {}
+        self._unlock_cache: Dict[str, Tuple[float, Optional[dict]]] = {}
         self._emissions_ts = 0.0
         self._watching: Dict[str, dict] = {}   # символы под наблюдением на истощение
         self._last_outcome_ts = 0.0
@@ -1349,13 +1394,30 @@ class PumpBot:
                 log.warning("контекст события по %s не получен: %s", sig.symbol, exc)
 
     async def event_context(self, symbol: str, feed: Feed) -> Optional[str]:
-        """Анлоки DefiLlama. Список тянется раз в час на весь бот, а не на каждый символ."""
+        """Анлоки DefiLlama по монете, которая сработала.
+
+        Список протоколов тянется раз в час на весь бот; тяжёлый датасет (под
+        мегабайт) — только по монете из алерта и с кэшем, а не по всей вселенной.
+        """
         ctx_cfg = self.cfg["event_context"]
         if now() - self._emissions_ts >= ctx_cfg["refresh_sec"]:
-            self._emissions = await feed.llama_emissions()
-            self._emissions_ts = now()
+            slugs = await feed.llama_protocols()
+            if slugs:
+                self._slug_map = build_slug_map(slugs, ctx_cfg.get("slug_overrides") or {})
+                self._emissions_ts = now()
+
         coin = base_coin(symbol, self.cfg["universe"]["quote_suffix"])
-        return unlock_context(self._emissions, coin, ctx_cfg["unlock_window_days"], now())
+        slug = (self._slug_map or {}).get(coin)
+        if not slug:
+            return None
+
+        cached = self._unlock_cache.get(coin)
+        if cached and now() - cached[0] < ctx_cfg["refresh_sec"]:
+            dataset = cached[1]
+        else:
+            dataset = await feed.llama_unlock_dataset(slug)
+            self._unlock_cache[coin] = (now(), dataset)
+        return unlock_context(dataset, ctx_cfg["unlock_window_days"], now())
 
     async def check_exhaustion(self, feed: Feed) -> List[Alert]:
         """Слой 3: второй алерт — импульс выдохся, вот момент для fade."""

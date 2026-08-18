@@ -83,18 +83,39 @@ class EventContextTestCase(unittest.TestCase):
         self.assertEqual(pump_bot.base_coin("1000PEPEUSDT", "USDT"), "PEPE")
         self.assertEqual(pump_bot.base_coin("1000000BABYDOGEUSDT", "USDT"), "BABYDOGE")
 
+    def dataset(self, days_ahead, tokens=56_000_000, max_supply=10_000_000_000,
+                category="insiders"):
+        """Форма ответа датасет-хоста DefiLlama (бесплатный, без ключа)."""
+        return {
+            "metadata": {"events": [{"timestamp": START_TS + days_ahead * 86400,
+                                     "noOfTokens": [tokens], "category": category,
+                                     "unlockType": "cliff"}]},
+            "supplyMetrics": {"maxSupply": max_supply},
+        }
+
     def test_unlock_within_window(self):
-        emissions = [{"token": "XYZ", "events": [{"timestamp": START_TS + 2 * 86400}]}]
-        text = pump_bot.unlock_context(emissions, "XYZ", 7.0, START_TS)
+        text = pump_bot.unlock_context(self.dataset(2), 7.0, START_TS)
         self.assertIsNotNone(text)
         self.assertIn("через 2.0 дн", text)
+        self.assertIn("0.56% supply", text)
+        self.assertIn("insiders", text)
 
-    def test_unlock_outside_window_and_bad_payload(self):
-        far = [{"token": "XYZ", "events": [{"timestamp": START_TS + 30 * 86400}]}]
-        self.assertIsNone(pump_bot.unlock_context(far, "XYZ", 7.0, START_TS))
-        self.assertIsNone(pump_bot.unlock_context(None, "XYZ", 7.0, START_TS))
-        self.assertIsNone(pump_bot.unlock_context([{"broken": True}], "XYZ", 7.0, START_TS))
-        self.assertIsNone(pump_bot.unlock_context(["мусор"], "XYZ", 7.0, START_TS))
+    def test_past_unlock_and_window_edges(self):
+        self.assertIn("был 3.0 дн", pump_bot.unlock_context(self.dataset(-3), 7.0, START_TS))
+        self.assertIsNone(pump_bot.unlock_context(self.dataset(30), 7.0, START_TS),
+                          "анлок за окном внимания не упоминается")
+
+    def test_bad_payloads_are_safe(self):
+        for payload in (None, {}, {"metadata": {}}, {"metadata": {"events": ["мусор"]}},
+                        {"metadata": {"events": [{"noOfTokens": [1]}]}}, ["не словарь"]):
+            self.assertIsNone(pump_bot.unlock_context(payload, 7.0, START_TS))
+
+    def test_slug_map_prefers_overrides(self):
+        mapping = pump_bot.build_slug_map(
+            ["arbitrum", "frax-finance", "gmx"], {"arbitrum": "ARB"})
+        self.assertEqual(mapping["ARB"], "arbitrum", "ручное соответствие сильнее нормализации")
+        self.assertEqual(mapping["FRAX"], "frax-finance")
+        self.assertEqual(mapping["GMX"], "gmx")
 
 
 class JournalTestCase(unittest.TestCase):

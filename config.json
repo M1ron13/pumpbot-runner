@@ -32,7 +32,8 @@
     "bybit_oi_hist_url": "https://api.bybit.com/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval}&limit={limit}",
     "binance_price_url": "https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}",
     "bybit_price_url": "https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}",
-    "llama_emissions_url": "https://api.llama.fi/emissions"
+    "llama_protocols_url": "https://defillama-datasets.llama.fi/emissionsProtocolsList",
+    "llama_dataset_url": "https://defillama-datasets.llama.fi/emissions/{slug}"
   },
   "universe": {
     "quote_suffix": "USDT",
@@ -112,7 +113,38 @@
   "event_context": {
     "enabled": true,
     "refresh_sec": 3600,
-    "unlock_window_days": 7
+    "unlock_window_days": 7,
+    "slug_overrides": {
+      "arbitrum": "ARB",
+      "celestia": "TIA",
+      "optimism": "OP",
+      "aptos": "APT",
+      "starknet": "STRK",
+      "jupiter": "JUP",
+      "worldcoin": "WLD",
+      "ethena": "ENA",
+      "sei-network": "SEI",
+      "immutable": "IMX",
+      "curve-finance": "CRV",
+      "the-graph": "GRT",
+      "lido-finance": "LDO",
+      "eigenlayer": "EIGEN",
+      "zksync": "ZK",
+      "wormhole": "W",
+      "layerzero": "ZRO",
+      "io-net": "IO",
+      "zetachain": "ZETA",
+      "altlayer": "ALT",
+      "dymension": "DYM",
+      "movement": "MOVE",
+      "scroll": "SCR",
+      "story": "IP",
+      "berachain": "BERA",
+      "hyperliquid": "HYPE",
+      "jito": "JTO",
+      "taiko": "TAIKO",
+      "ether-fi": "ETHFI"
+    }
   },
   "journal": {
     "db_file": "signals.db",
