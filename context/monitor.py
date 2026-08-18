@@ -18,9 +18,10 @@ import time
 from context import config as ctx_config
 from context.cache import Cache
 from context.matcher import TickerMatcher
-from context import signals
+from context import dedup, heartbeat, signals
+from context.classify import Classifier, normalize_category
 from context.publisher import Publisher
-from context.sources import announcements, market, structural
+from context.sources import announcements, market, rss, structural
 
 log = logging.getLogger("context.monitor")
 
@@ -131,6 +132,87 @@ async def poll_funding(session, cfg: dict, cache: Cache) -> int:
     return changes
 
 
+async def poll_rss(session, cfg: dict, cache: Cache) -> int:
+    """RSS первоисточников → кандидаты новостей с распознанной монетой.
+
+    Матчинг здесь тот же, что для анонсов: короткие тикеры требуют имени проекта в
+    тексте. Для SEC это особенно важно — в исках тикеров нет вообще, только названия.
+    """
+    if not cfg["rss"]["enabled"]:
+        return 0
+    items = await rss.poll(session, cfg, cache)
+    if not items:
+        return 0
+    matcher = TickerMatcher(cfg, cache)
+    added = unmatched = 0
+    clustered = dedup.cluster(items, cfg)
+    for item in clustered:
+        text = f"{item['title']} {item.get('summary') or ''}"
+        match = matcher.match(text, item["source"])
+        if not match:
+            unmatched += 1
+            continue
+        # ключ события: по нему считаются независимые подтверждения из разных фидов
+        event_key = f"{match['ticker']}:{dedup.normalize(item['title'])[:6]}"
+        added += int(cache.add_news_candidate(
+            ts=item["ts"], source=item["source"], feed=item.get("feed"),
+            source_tier=item.get("source_tier"), ticker=match["ticker"],
+            title=item["title"], summary=item.get("summary"), url=item.get("url"),
+            event_key=" ".join(event_key.split()),
+            confirmations=1 + int(item.get("duplicates") or 0)))
+    log.info("RSS: элементов %s, после дедупа %s, новых кандидатов %s, без монеты %s",
+             len(items), len(clustered), added, unmatched)
+    return added
+
+
+async def classify_news(session, cfg: dict, cache: Cache) -> int:
+    """Кандидаты → LLM → решение по Типу 4. Без ключа классификация не запускается."""
+    pending = cache.unclassified_news()
+    if not pending:
+        return 0
+    classifier = Classifier(cfg, session, cache,
+                            timeout_ms=cfg["classification"]["background_timeout_ms"])
+    if not classifier.provider:
+        log.info("классификация пропущена: нет ключа LLM (%s кандидатов ждут)", len(pending))
+        return 0
+
+    outcome = await classifier.classify("НОВОСТИ", pending)
+    if outcome["status"] != "ок":
+        log.warning("классификация: %s", outcome["status"])
+        return 0
+
+    published = 0
+    publisher = Publisher(cfg, cache, await make_sender(session, cfg))
+    for item in outcome["items"]:
+        index = int(item.get("headline_id", 0)) - 1
+        if not (0 <= index < len(pending)):
+            continue
+        candidate = pending[index]
+        news = {
+            "ticker": candidate["ticker"],
+            "category": normalize_category(item.get("event_type")),
+            "is_fact": bool(item.get("is_fact")), "source_tier": min(
+                int(candidate["source_tier"] or 3), int(item.get("source_tier") or 3)),
+            "confidence": float(item.get("confidence") or 0.0),
+            "confirmations": cache.count_confirmations(candidate["event_key"]),
+            "summary": candidate["title"], "source_name": candidate["feed"],
+            "url": candidate["url"], "ts": candidate["ts"],
+            "event_key": candidate["event_key"],
+        }
+        message, label = publisher.message_for_news(news, time.time())
+        if message is None:
+            cache.save_classification(candidate["id"], news["category"], news["is_fact"],
+                                      news["confidence"], f"лог: {label}")
+            continue
+        sent, label = await publisher.publish(message, time.time())
+        cache.save_classification(candidate["id"], news["category"], news["is_fact"],
+                                  news["confidence"],
+                                  ("канал: " if sent else "лог: ") + label)
+        published += int(sent)
+    log.info("классификация: разобрано %s, отправлено %s", len(outcome["items"]), published)
+    return published
+
+
 async def poll_instruments(session, cfg: dict, cache: Cache) -> int:
     events = await structural.instruments_diff(session, cfg, cache)
     matcher = TickerMatcher(cfg, cache)
@@ -149,14 +231,22 @@ async def poll_instruments(session, cfg: dict, cache: Cache) -> int:
     return added
 
 
-async def loop_source(name: str, interval_sec: float, coro_factory) -> None:
-    """Один источник — один цикл. Ошибка в источнике не роняет остальные."""
+async def loop_source(name: str, interval_sec: float, coro_factory, cache=None) -> None:
+    """Один источник — один цикл. Ошибка в источнике не роняет остальные.
+
+    Отметка прогресса ставится после итерации — включая неудачную по сети: важно, что
+    цикл жив и вернулся, а не что данные пришли. Зависший запрос отметку не обновит,
+    и следующий инстанс это увидит.
+    """
     while True:
         started = time.time()
         try:
             await coro_factory()
         except Exception as exc:
             log.warning("%s: %s", name, exc)
+        if cache is not None:
+            heartbeat.mark_loop(cache, name, interval_sec)
+            heartbeat.mark_owner(cache)
         elapsed = time.time() - started
         await asyncio.sleep(max(1.0, interval_sec - elapsed))
 
@@ -213,6 +303,12 @@ async def run_once(session, cfg: dict, cache: Cache) -> dict:
             stats["coinmarketcal"] = added
         except Exception as exc:
             log.warning("coinmarketcal: %s", exc)
+    if cfg["rss"]["enabled"]:
+        try:
+            stats["rss"] = await poll_rss(session, cfg, cache)
+            stats["классификация"] = await classify_news(session, cfg, cache)
+        except Exception as exc:
+            log.warning("RSS: %s", exc)
     if cfg["signals"]["funding"]["enabled"]:
         try:
             stats["фандинг"] = await poll_funding(session, cfg, cache)
@@ -236,15 +332,30 @@ async def main_async(once: bool) -> int:
              [k for k, v in cfg["enabled_sources"].items() if v])
     async with aiohttp.ClientSession() as session:
         if once:
+            # разовый прогон тоже обязан уступать: два пишущих инстанса — это то,
+            # от чего защищает механизм прав, и «database is locked» тому симптом
+            decision = heartbeat.claim_leadership(cache, cfg)
+            if not decision["claim"]:
+                log.info("разовый прогон отменён: %s", decision["reason"])
+                cache.close()
+                return 0
             stats = await run_once(session, cfg, cache)
             log.info("проход завершён: %s", stats)
             cache.close()
             return 0
 
         monitor = cfg["monitor"]
+        decision = heartbeat.claim_leadership(cache, cfg)
+        log.info("права на работу: %s (%s)",
+                 "заняты" if decision["claim"] else "уступлены", decision["reason"])
+        if not decision["claim"]:
+            cache.close()
+            return 0
+        heartbeat.mark_owner(cache)
+
         tasks = [
             loop_source("справочник монет", monitor["coins_dictionary_sec"],
-                        lambda: refresh_coins(session, cfg, cache)),
+                        lambda: refresh_coins(session, cfg, cache), cache),
         ]
         for source, key in (("bybit_announcements", "bybit_sec"),
                             ("binance_announcements", "binance_sec"),
@@ -252,18 +363,24 @@ async def main_async(once: bool) -> int:
                             ("okx_announcements", "okx_sec")):
             if ctx_config.enabled(cfg, source):
                 tasks.append(loop_source(source, monitor[key],
-                                         lambda s=source: poll_announcements(session, cfg, cache, s)))
+                                         lambda s=source: poll_announcements(session, cfg, cache, s),
+                                         cache))
         if ctx_config.enabled(cfg, "instruments_diff"):
             tasks.append(loop_source("диффы инструментов", monitor["instruments_sec"],
-                                     lambda: poll_instruments(session, cfg, cache)))
+                                     lambda: poll_instruments(session, cfg, cache), cache))
+        if cfg["rss"]["enabled"]:
+            tasks.append(loop_source("rss", monitor["rss_sec"],
+                                     lambda: poll_rss(session, cfg, cache), cache))
+            tasks.append(loop_source("классификация новостей", monitor["rss_sec"],
+                                     lambda: classify_news(session, cfg, cache), cache))
         if cfg["signals"]["funding"]["enabled"]:
             tasks.append(loop_source("фандинг", monitor["funding_sec"],
-                                     lambda: poll_funding(session, cfg, cache)))
+                                     lambda: poll_funding(session, cfg, cache), cache))
         if cfg["publisher"]["enabled"]:
             sender = await make_sender(session, cfg)
             publisher = Publisher(cfg, cache, sender)
             tasks.append(loop_source("публикатор", monitor["publisher_sec"],
-                                     publisher.run_once))
+                                     publisher.run_once, cache))
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:

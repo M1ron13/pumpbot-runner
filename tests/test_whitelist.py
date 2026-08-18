@@ -370,5 +370,31 @@ class SinglePointOfSendTestCase(unittest.TestCase):
             self.assertIn(label, text, f"в guard-цепочке нет метки {label}")
 
 
+
+class CategoryAlignmentTestCase(WhitelistBase):
+    """Найдено живым прогоном: схема LLM и закрытый список должны совпадать."""
+
+    def test_llm_categories_map_into_closed_list(self):
+        from context.classify import CATEGORY_ALIASES, normalize_category
+        for raw, expected in CATEGORY_ALIASES.items():
+            self.assertEqual(normalize_category(raw), expected)
+            self.assertIn(expected, pub.MAJOR_NEWS_CATEGORIES,
+                          f"{raw} должен приводиться к категории закрытого списка")
+
+    def test_hack_is_publishable_as_security(self):
+        """Инцидент безопасности по монете из universe обязан проходить."""
+        from context.classify import normalize_category
+        news = self.news(category=normalize_category("HACK"), source_tier=1,
+                         confirmations=1, summary="Эксплойт моста, выведено $30M")
+        sent, label = self.publish_news(news)
+        self.assertTrue(sent, label)
+        self.assertIn("Инцидент безопасности", self.sender.sent[0])
+
+    def test_schema_lists_only_closed_list_categories(self):
+        from context import classify
+        for name in pub.MAJOR_NEWS_CATEGORIES:
+            self.assertIn(name, classify.SYSTEM_PROMPT,
+                          f"категория {name} должна быть в схеме промпта")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -18,13 +18,33 @@ import re
 import time
 from typing import List, Optional
 
+# Категории в схеме должны совпадать с закрытым списком публикатора: живой прогон
+# показал, что модель отдавала HACK, а список ждал SECURITY — реальный инцидент
+# отклонялся по неверной причине. Ниже — точные имена плюс карта старых значений.
+CATEGORY_ALIASES = {
+    "HACK": "SECURITY",
+    "LEADERSHIP": "LEADERSHIP_CRIMINAL",
+    "UNLOCK": "SCHEDULED",
+    "BANKRUPTCY": "PROJECT_CRITICAL",
+}
+
+
+def normalize_category(value: str) -> str:
+    name = str(value or "").upper()
+    return CATEGORY_ALIASES.get(name, name)
+
+
 SYSTEM_PROMPT = (
     "Ты классифицируешь крипто-новости для риск-контекста. Отвечай ТОЛЬКО валидным JSON "
-    "по схеме {\"items\":[{\"headline_id\":int,\"event_type\":\"LISTING|REGULATORY|LEGAL|"
-    "LEADERSHIP|POLITICAL_MENTION|PARTNERSHIP|HACK|UNLOCK|OTHER\",\"direction\":\"bullish|"
+    "по схеме {\"items\":[{\"headline_id\":int,\"event_type\":\"LEGAL|LEADERSHIP_CRIMINAL|"
+    "REGULATORY|POLITICAL_MENTION|SECURITY|PROJECT_CRITICAL|SCHEDULED|LISTING|PARTNERSHIP|"
+    "OTHER\",\"direction\":\"bullish|"
     "bearish|unclear\",\"is_fact\":bool,\"source_tier\":1|2|3,\"confidence\":0..1,"
     "\"reasoning\":\"одно предложение\"}]}. "
     "is_fact=false, если это слух, план или пересказ («sources say», «reportedly», «планирует»). "
+    "SECURITY — хак, эксплойт, кража, остановка выводов. LEADERSHIP_CRIMINAL — арест, "
+    "уголовное дело, смерть основателя. SCHEDULED — событие с датой в будущем: анлок, "
+    "суд, mainnet. PROJECT_CRITICAL — банкротство, прекращение проекта, rug pull. "
     "source_tier: 1 — первоисточник (регулятор, ведомство, официальный аккаунт), "
     "2 — Reuters/Bloomberg/AP, 3 — крипто-медиа. "
     "Опровержение слуха не является бычьей новостью."
@@ -87,11 +107,14 @@ def apply_rules(items: List[dict], cfg: dict) -> dict:
 
 
 class Classifier:
-    def __init__(self, cfg: dict, session=None, cache=None):
+    def __init__(self, cfg: dict, session=None, cache=None, timeout_ms: float = None):
         self.cfg = cfg
         self.rules = cfg["classification"]
         self.session = session
         self.cache = cache
+        # у пути алерта бюджет 2 секунды, у фоновой классификации новостей его нет:
+        # там важнее разобрать батч, чем успеть к отправке сообщения
+        self.timeout_ms = float(timeout_ms or self.rules["timeout_ms"])
 
     @property
     def provider(self) -> Optional[str]:
@@ -135,7 +158,7 @@ class Classifier:
     async def _call(self, symbol: str, headlines: List[dict]) -> str:
         import aiohttp
         provider = self.provider
-        timeout = aiohttp.ClientTimeout(total=float(self.rules["timeout_ms"]) / 1000.0)
+        timeout = aiohttp.ClientTimeout(total=self.timeout_ms / 1000.0)
         user = build_user_prompt(symbol, headlines)
 
         if provider == "groq":

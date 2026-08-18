@@ -90,6 +90,27 @@ CREATE TABLE IF NOT EXISTS enrichments (
     sources_failed TEXT
 );
 
+CREATE TABLE IF NOT EXISTS news_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    source TEXT NOT NULL,
+    feed TEXT,
+    source_tier INTEGER,
+    ticker TEXT,
+    title TEXT,
+    summary TEXT,
+    url TEXT,
+    event_key TEXT,
+    confirmations INTEGER DEFAULT 1,
+    classified_ts REAL,
+    category TEXT,
+    is_fact INTEGER,
+    confidence REAL,
+    decision TEXT,
+    UNIQUE(source, url, title)
+);
+CREATE INDEX IF NOT EXISTS idx_news_candidates_state ON news_candidates(classified_ts, ts);
+
 CREATE TABLE IF NOT EXISTS signal_state (
     symbol TEXT NOT NULL,
     kind TEXT NOT NULL,
@@ -160,6 +181,8 @@ class Cache:
         self.conn = sqlite3.connect(path, timeout=10.0, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        # два процесса не должны падать на коротком пересечении записи
+        self.conn.execute("PRAGMA busy_timeout=30000")
         self.conn.executescript(SCHEMA)
         # миграция баз, созданных до появления адресов контрактов
         columns = {r[1] for r in self.conn.execute("PRAGMA table_info(coins)")}
@@ -323,6 +346,45 @@ class Cache:
              kwargs.get("block"), kwargs.get("budget_ms"), kwargs.get("elapsed_ms"),
              ",".join(kwargs.get("sources_ok") or []), ",".join(kwargs.get("sources_failed") or [])))
         self.conn.commit()
+
+    # -- кандидаты новостей (RSS и прочий свободный текст) --------------------- #
+
+    def add_news_candidate(self, **kwargs) -> bool:
+        """True — кандидат новый. Дубли одной статьи гасятся уникальным ключом."""
+        try:
+            self.conn.execute(
+                "INSERT INTO news_candidates (ts, source, feed, source_tier, ticker, title,"
+                " summary, url, event_key, confirmations) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (kwargs.get("ts", time.time()), kwargs["source"], kwargs.get("feed"),
+                 kwargs.get("source_tier"), kwargs.get("ticker"), kwargs.get("title"),
+                 kwargs.get("summary"), kwargs.get("url"), kwargs.get("event_key"),
+                 int(kwargs.get("confirmations") or 1)))
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def unclassified_news(self, limit: int = 20) -> List[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM news_candidates WHERE classified_ts IS NULL AND ticker IS NOT NULL"
+            " ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def save_classification(self, candidate_id: int, category: str, is_fact: bool,
+                            confidence: float, decision: str, now_ts: float = None) -> None:
+        self.conn.execute(
+            "UPDATE news_candidates SET classified_ts = ?, category = ?, is_fact = ?,"
+            " confidence = ?, decision = ? WHERE id = ?",
+            (now_ts if now_ts is not None else time.time(), category,
+             1 if is_fact else 0, confidence, decision, candidate_id))
+        self.conn.commit()
+
+    def count_confirmations(self, event_key: str) -> int:
+        """Сколько независимых источников написали об этом событии."""
+        row = self.conn.execute(
+            "SELECT COUNT(DISTINCT feed) AS n FROM news_candidates WHERE event_key = ?",
+            (event_key,)).fetchone()
+        return max(1, int(row["n"] or 1))
 
     # -- состояния внутренних сигналов ---------------------------------------- #
 

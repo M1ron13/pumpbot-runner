@@ -20,7 +20,10 @@
     "kucoin_sec": 60,
     "publisher_sec": 60,
     "publish_ledger_sec": 2592000,
-    "funding_sec": 300
+    "funding_sec": 300,
+    "heartbeat_stale_sec": 900,
+    "heartbeat_interval_factor": 3,
+    "rss_sec": 120
   },
   "sources": {
     "bybit_announcements": "https://api.bybit.com/v5/announcements/index?locale=en-US&limit=50",
@@ -68,16 +71,18 @@
     "cryptopanic": false,
     "arkham": false,
     "coinglass": false,
-    "kucoin_announcements": true
+    "kucoin_announcements": true,
+    "rss": true
   },
   "_почему_выключено": {
     "okx_announcements": "корп-сеть сбрасывает соединение с okx.com по SNI (проверено 18.08.2026)",
     "tavily": "нужен TAVILY_API_KEY: MCP-коннектор доступен только в сессии Claude Code, боту — нет",
-    "cryptopanic": "нужен CRYPTOPANIC_TOKEN, без него источник отдаёт HTTP 403",
+    "cryptopanic": "бесплатный Developer-план закрыт с 01.04.2026; код остаётся за флагом на случай покупки платного тарифа",
     "coinmarketcal": "нужен COINMARKETCAL_KEY",
     "alpha_vantage": "не подключаем: бесплатный тир 25 запросов в сутки — для алертов бесполезен",
     "arkham": "интерфейс предусмотрен, реализация позже",
-    "coinglass": "платный; поле под ликвидации в risk_context зарезервировано"
+    "coinglass": "платный; поле под ликвидации в risk_context зарезервировано",
+    "reddit": "вычеркнут из пакета: доступ теперь требует одобрения заявки, а политика ограничивает использование данных с LLM — код не пишется"
   },
   "matching": {
     "short_ticker_max_len": 4,
@@ -103,7 +108,7 @@
   },
   "classification": {
     "provider": "groq",
-    "groq_model": "llama-3.3-70b-versatile",
+    "groq_model": "openai/gpt-oss-120b",
     "groq_url": "https://api.groq.com/openai/v1/chat/completions",
     "anthropic_model": "claude-haiku-4-5-20251001",
     "anthropic_url": "https://api.anthropic.com/v1/messages",
@@ -118,7 +123,9 @@
     "bearish": {
       "direction": "bearish",
       "min_confidence": 0.6
-    }
+    },
+    "_комментарий_модель": "llama-3.3-70b-versatile выведена из эксплуатации Groq (HTTP 404 model_not_found). Проверено 18.08.2026: JSON-режим работает у groq/compound, compound-mini, openai/gpt-oss-120b и 20b, qwen/qwen3.6-27b. Выбрана gpt-oss-120b как самая крупная из доступных: классификация новостей — про смысл, не про скорость.",
+    "background_timeout_ms": 25000
   },
   "dedup": {
     "shingle_size": 2,
@@ -283,5 +290,45 @@
       "fx_cache_sec": 3600,
       "markets_cache_sec": 86400
     }
+  },
+  "rss": {
+    "_комментарий": "Первоисточники. Подняты выше Telegram в очереди: бесплатны и закрывают нишу выпавших CryptoPanic и Reddit.",
+    "enabled": true,
+    "poll_sec": 120,
+    "user_agent": "pumpbot-context/1.0 (research; contact a.yermekbayev@ngdem.com)",
+    "feeds": [
+      {
+        "name": "sec_press",
+        "tier": 1,
+        "enabled": true,
+        "url": "https://www.sec.gov/news/pressreleases.rss",
+        "note": "иски и обвинения («SEC Charges …») раньше, чем их перепишут крипто-медиа; старый URL litigation/litreleases.xml отдаёт 404 с 2026 года"
+      },
+      {
+        "name": "sec_admin",
+        "tier": 1,
+        "enabled": false,
+        "url": "https://www.sec.gov/rss/litigation/admin.xml",
+        "note": "административные дела; в заголовках только имена без контекста — матчинг на монету почти не работает, поэтому выключен"
+      },
+      {
+        "name": "coindesk",
+        "tier": 3,
+        "enabled": true,
+        "url": "https://www.coindesk.com/arc/outboundfeeds/rss/"
+      },
+      {
+        "name": "theblock",
+        "tier": 3,
+        "enabled": true,
+        "url": "https://www.theblock.co/rss.xml"
+      },
+      {
+        "name": "cointelegraph",
+        "tier": 3,
+        "enabled": true,
+        "url": "https://cointelegraph.com/rss"
+      }
+    ]
   }
 }
