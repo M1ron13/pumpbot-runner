@@ -31,6 +31,7 @@ REASON_TICKER = "нет распознанного тикера"
 REASON_CLASS = "класс не входит в разрешённые"
 REASON_RATE = "лимит частоты"
 REASON_TYPE = "тип события не публикуется"
+REASON_DUPLICATE = "такое сообщение уже отправлялось"
 
 
 class Publisher:
@@ -121,6 +122,15 @@ class Publisher:
                          event.get("event_type"), event.get("ticker") or "?",
                          blocked, verdict.get("reason"))
                 self.mark(event["id"], now_ts, f"лог: {blocked}")
+                stats["в лог"] += 1
+                continue
+            # идемпотентность по тексту: второй отправитель, второй процесс или
+            # рестарт посреди отправки не должны дать второе сообщение
+            if not self.cache.remember_sent(outcome["text"], symbol=event.get("ticker"),
+                                            sender="publisher", now_ts=now_ts):
+                log.info("не отправлено [%s] %s %s — %s", event.get("source"),
+                         event.get("event_type"), event.get("ticker"), REASON_DUPLICATE)
+                self.mark(event["id"], now_ts, f"лог: {REASON_DUPLICATE}")
                 stats["в лог"] += 1
                 continue
             sent = True

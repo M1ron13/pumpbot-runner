@@ -6,6 +6,7 @@
 матчинга тикеров постфактум: без неё ложные сопоставления невидимы.
 """
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -87,6 +88,13 @@ CREATE TABLE IF NOT EXISTS enrichments (
     elapsed_ms INTEGER,
     sources_ok TEXT,
     sources_failed TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sent_messages (
+    hash TEXT PRIMARY KEY,
+    ts REAL NOT NULL,
+    symbol TEXT,
+    sender TEXT
 );
 
 CREATE TABLE IF NOT EXISTS monitor_state (
@@ -269,6 +277,31 @@ class Cache:
              kwargs.get("block"), kwargs.get("budget_ms"), kwargs.get("elapsed_ms"),
              ",".join(kwargs.get("sources_ok") or []), ",".join(kwargs.get("sources_failed") or [])))
         self.conn.commit()
+
+    # -- журнал отправленных сообщений ---------------------------------------- #
+
+    def remember_sent(self, text: str, symbol: str = None, sender: str = None,
+                      now_ts: float = None) -> bool:
+        """True — сообщение новое и его можно отправлять.
+
+        Ключ — хэш самого текста. Это защита не от «своего» дедупа, а от любого
+        второго отправителя: два пайплайна, два процесса, рестарт посреди отправки —
+        всё равно одно сообщение уйдёт один раз.
+        """
+        digest = hashlib.sha1((text or "").strip().encode("utf-8")).hexdigest()
+        try:
+            self.conn.execute(
+                "INSERT INTO sent_messages (hash, ts, symbol, sender) VALUES (?,?,?,?)",
+                (digest, now_ts if now_ts is not None else time.time(), symbol, sender))
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def sent_count(self, since_ts: float) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS n FROM sent_messages WHERE ts >= ?",
+                                (since_ts,)).fetchone()
+        return int(row["n"] or 0)
 
     # -- состояние монитора --------------------------------------------------- #
 

@@ -223,11 +223,15 @@
       "CET",
       "UTC",
       "PERP"
+    ],
+    "tradable_exchanges": [
+      "BINANCE",
+      "BYBIT"
     ]
   },
   "publisher": {
     "_комментарий": "Единственная точка отправки событий в канал. Лимиты и выключатель — защита от повторения инцидента.",
-    "enabled": true,
+    "enabled": false,
     "shadow_sources": [],
     "max_per_hour": 6,
     "max_per_day": 20,

@@ -48,10 +48,13 @@ class PublisherTestBase(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def publisher(self, **overrides):
-        self.cfg["publisher"] = {**self.cfg["publisher"], **overrides}
+        # тесты не зависят от боевого выключателя: он может быть выключен в проде,
+        # а проверять надо сами ограничители
+        base = {**self.cfg["publisher"], "enabled": True}
+        self.cfg["publisher"] = {**base, **overrides}
         return Publisher(self.cfg, self.cache, self.sender)
 
-    def add_event(self, *, event_type="LISTING", ticker="XYZ", source="UPBIT",
+    def add_event(self, *, event_type="LISTING", ticker="XYZ", source="BINANCE",
                   title=None, ts=NOW, url="https://example.com/1"):
         title = title if title is not None else f"{source} will list Something ({ticker})"
         self.cache.add_event(ts=ts, source=source, event_type=event_type, ticker=ticker,
@@ -101,8 +104,8 @@ class KillSwitchTestCase(PublisherTestBase):
         self.assertEqual(self.sender.sent, [])
 
     def test_shadow_source_is_collected_but_silent(self):
-        self.add_event(ticker="NEWCOIN", source="UPBIT")
-        publisher = self.publisher(shadow_sources=["UPBIT"])
+        self.add_event(ticker="NEWCOIN", source="BINANCE")
+        publisher = self.publisher(shadow_sources=["BINANCE"])
         outcome = publisher.evaluate(publisher.pending()[0], NOW)
         self.assertEqual(outcome["blocked"], REASON_SHADOW)
         self.assertEqual(self.run_publisher(publisher)["отправлено"], 0)
@@ -201,6 +204,71 @@ class NoRepeatAfterPurgeTestCase(PublisherTestBase):
         publisher = self.publisher()
         self.assertEqual(self.run_publisher(publisher)["отправлено"], 1)
         self.assertEqual(len(self.sender.sent), 1, "одно событие — одно сообщение")
+
+
+class ProdIncidentFixesTestCase(PublisherTestBase):
+    """Три дефекта, замеченные владельцем в проде."""
+
+    def test_upbit_delisting_is_weak_bearish_not_operational(self):
+        """(б) Upbit мы не торгуем — уход монеты оттуда это фон, а не операционка."""
+        verdict = rules.decide(event_type="DELISTING", exchange="UPBIT", ticker="STORJ",
+                               market="spot", places=[{"exchange": "BINANCE", "market": "perp",
+                                                       "symbol": "STORJUSDT"}],
+                               cfg=rules.load_config())
+        self.assertEqual(verdict["class"], rules.WEAK_BEARISH)
+        self.assertFalse(verdict["post"])
+
+    def test_binance_delisting_stays_operational(self):
+        verdict = rules.decide(event_type="DELISTING", exchange="BINANCE", ticker="AERGO",
+                               market="perp", places=[{"exchange": "BINANCE", "market": "perp",
+                                                       "symbol": "AERGOUSDT"}],
+                               cfg=rules.load_config())
+        self.assertEqual(verdict["class"], rules.OPERATIONAL)
+        self.assertTrue(verdict["post"])
+
+    def test_coin_outside_universe_is_never_posted(self):
+        """(в) «на отслеживаемых площадках не найдена» → постить нечего."""
+        verdict = rules.decide(event_type="DELISTING", exchange="UPBIT", ticker="TT",
+                               market="spot", places=[], cfg=rules.load_config())
+        self.assertEqual(verdict["class"], rules.OUT_OF_UNIVERSE)
+        self.assertFalse(verdict["post"])
+
+    def test_listing_on_our_exchange_still_passes(self):
+        """Листинг на Binance вводит монету в нашу вселенную — это не «вне вселенной»."""
+        verdict = rules.decide(event_type="LISTING", exchange="BINANCE", ticker="GIGADEV",
+                               market="perp", places=[], cfg=rules.load_config())
+        self.assertEqual(verdict["class"], rules.STRONG_BULLISH)
+        self.assertTrue(verdict["post"])
+
+    def test_upbit_delisting_does_not_reach_channel_end_to_end(self):
+        self.add_event(event_type="DELISTING", ticker="STORJ", source="UPBIT",
+                       title="스토리지(STORJ) 거래지원 종료 안내", url="https://upbit.com/n/storj")
+        stats = self.run_publisher(self.publisher())
+        self.assertEqual(stats["отправлено"], 0)
+        self.assertEqual(self.sender.sent, [])
+
+
+class IdempotencyTestCase(PublisherTestBase):
+    """(а) Второй отправитель не может продублировать сообщение."""
+
+    def test_two_publishers_send_once(self):
+        self.add_event(ticker="NEWCOIN", url="https://example.com/one")
+        first = self.publisher()          # через хелпер: ограничители включены
+        asyncio.run(first.run_once(now_ts=NOW))
+        self.assertEqual(len(self.sender.sent), 1)
+
+        # то же событие вернулось в очередь (например, второй пайплайн переоткрыл кэш)
+        self.cache.conn.execute("UPDATE events SET published_ts = NULL, publish_decision = NULL")
+        self.cache.conn.commit()
+        second = Publisher(self.cfg, self.cache, self.sender)
+        stats = asyncio.run(second.run_once(now_ts=NOW + 5))
+        self.assertEqual(stats["отправлено"], 0, "повтор обязан быть отклонён по журналу хэшей")
+        self.assertEqual(len(self.sender.sent), 1)
+
+    def test_hash_ledger_is_content_based(self):
+        self.assertTrue(self.cache.remember_sent("сообщение А", symbol="A"))
+        self.assertFalse(self.cache.remember_sent("сообщение А", symbol="A"))
+        self.assertTrue(self.cache.remember_sent("сообщение Б", symbol="B"))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

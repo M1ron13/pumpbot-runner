@@ -33,6 +33,8 @@ CONFIG_SECTION = "listing"
 # классы решений
 STRONG_BULLISH = "STRONG_BULLISH"
 WEAK = "WEAK"
+WEAK_BEARISH = "WEAK_BEARISH"
+OUT_OF_UNIVERSE = "OUT_OF_UNIVERSE"
 BEARISH_SETUP = "BEARISH_SETUP"
 OPERATIONAL = "OPERATIONAL"
 HOLD = "HOLD"
@@ -46,6 +48,9 @@ DEFAULTS = {
     ],
     "post_classes": [STRONG_BULLISH, BEARISH_SETUP, OPERATIONAL],
     "major_exchanges": ["BINANCE", "UPBIT", "COINBASE"],
+    # где МЫ торгуем: только делистинг здесь операционно важен
+    "tradable_exchanges": ["BINANCE", "BYBIT"],
+    # за чьими анонсами следим: событие оттуда — информация, но не наша операционка
     "monitored_exchanges": ["BINANCE", "BYBIT", "UPBIT", "OKX", "KUCOIN"],
     "parse_failed_warn_share": 0.3,
     "instruments_db": os.path.join(os.path.dirname(os.path.dirname(
@@ -207,6 +212,7 @@ def decide(*, event_type: str, exchange: str, ticker: Optional[str], market: Opt
     exchange = (exchange or "").upper()
     majors = {m.upper() for m in cfg["major_exchanges"]}
     monitored = {m.upper() for m in cfg["monitored_exchanges"]}
+    tradable = {m.upper() for m in cfg.get("tradable_exchanges") or ["BINANCE", "BYBIT"]}
     post_classes = set(cfg["post_classes"])
 
     def result(cls: str, reason: str) -> dict:
@@ -216,14 +222,25 @@ def decide(*, event_type: str, exchange: str, ticker: Optional[str], market: Opt
         return {"class": REJECTED, "post": False,
                 "reason": "тикер не распознан — событие непригодно для проверки"}
 
+    # монета, которой нет на биржах, где мы торгуем, нам недоступна — постить нечего.
+    # Исключение: листинг на нашей бирже как раз и вводит монету в universe.
+    if places is not None and not places and exchange not in tradable:
+        return {"class": OUT_OF_UNIVERSE, "post": False,
+                "reason": f"монеты нет на {', '.join(sorted(tradable))} — вне нашей вселенной"}
+
     if event_type in ("DELISTING", "DELISTED"):
         if product_only:
             # «Margin And Loan Will Delist BTTC» — сворачивают кредитный продукт,
             # сами торги не прекращаются: к торговле перпами это не относится
             return {"class": WEAK, "post": False,
                     "reason": "делистинг продукта (маржа/кредиты/сбережения), торги продолжаются"}
+        if exchange in tradable:
+            return result(OPERATIONAL, f"делистинг на {exchange} — торгуем там, операционно важно")
         if exchange in monitored:
-            return result(OPERATIONAL, f"делистинг на {exchange} — операционно важно")
+            # уход монеты с Upbit/OKX/KuCoin — медвежий фон, но не наша операционка:
+            # позиция там не держится, действий не требуется
+            return {"class": WEAK_BEARISH, "post": False,
+                    "reason": f"делистинг на {exchange} — там мы не торгуем, только фон"}
         return {"class": WEAK, "post": False, "reason": f"делистинг на немониторимой бирже {exchange}"}
 
     if event_type not in ("LISTING", "NEW_INSTRUMENT", "PERP_LAUNCH", "FUTURES"):
@@ -263,7 +280,8 @@ PATTERN_NOTE = ("⚠️ Типовой паттерн: рост до листи�
                 "Анонсы систематически утекают инсайдерам — часть движения до анонса "
                 "означает, что ранние уже в позиции.")
 
-ICONS = {STRONG_BULLISH: "🟢", BEARISH_SETUP: "🩳", OPERATIONAL: "🔴"}
+ICONS = {STRONG_BULLISH: "🟢", BEARISH_SETUP: "🩳", OPERATIONAL: "🔴",
+         WEAK_BEARISH: "📉", OUT_OF_UNIVERSE: "⬜", WEAK: "ℹ️"}
 
 
 def render(event: dict, verdict: dict, places: Optional[List[dict]]) -> str:
