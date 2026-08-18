@@ -1601,6 +1601,38 @@ async def run_outcomes_once(cfg: dict) -> None:
     bot.journal.close()
 
 
+def warn_config_drift(path: str) -> None:
+    """Сверка боевого конфига с шаблоном config.json.
+
+    Локальная копия с секретами живёт отдельно и легко отстаёт от шаблона: именно так
+    пропали network-ключи слоя анлоков, и контекст падал на каждом алерте. Молча это
+    больше не проходит.
+    """
+    template_path = os.path.join(os.path.dirname(os.path.abspath(path)), "config.json")
+    if os.path.abspath(template_path) == os.path.abspath(path):
+        return
+    try:
+        with open(template_path, "r", encoding="utf-8") as fh:
+            template = json.load(fh)
+        with open(path, "r", encoding="utf-8") as fh:
+            current = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return
+
+    missing = []
+    for section, values in template.items():
+        if not isinstance(values, dict):
+            if section not in current:
+                missing.append(section)
+            continue
+        for key in values:
+            if key not in (current.get(section) or {}):
+                missing.append(f"{section}.{key}")
+    if missing:
+        log.warning("конфиг %s отстал от config.json, не хватает: %s",
+                    os.path.basename(path), ", ".join(missing[:12]))
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Pump Detector Bot")
     parser.add_argument("mode", nargs="?", default="run", choices=("run", "outcomes", "report"),
@@ -1610,6 +1642,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     cfg = load_config(args.config)
     setup_logging(cfg)
+    warn_config_drift(args.config)
 
     if args.mode == "report":
         journal = SignalJournal(cfg["journal"]["db_file"])
