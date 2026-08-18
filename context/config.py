@@ -21,11 +21,36 @@ ENV_KEYS = {
 }
 
 
+def load_env_file(path: str = None) -> dict:
+    """Ключи из pumpbot/.env — чтобы не искать, куда их вписывать.
+
+    Переменные окружения приоритетнее файла: в планировщике удобнее файл, в разовом
+    запуске — окружение.
+    """
+    path = path or os.path.join(BOT_DIR, ".env")
+    values = {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, _, value = line.partition("=")
+                value = value.strip().strip('"').strip("'")
+                if value:
+                    values[name.strip()] = value
+    except FileNotFoundError:
+        pass
+    return values
+
+
 def load(path: str = DEFAULT_PATH) -> dict:
     with open(path, "r", encoding="utf-8") as fh:
         cfg = json.load(fh)
     cfg["_path"] = path
-    cfg["keys"] = {name: os.environ.get(env, "") for name, env in ENV_KEYS.items()}
+    from_file = load_env_file()
+    cfg["keys"] = {name: (os.environ.get(env) or from_file.get(env, ""))
+                   for name, env in ENV_KEYS.items()}
     # источник без ключа считается выключенным, даже если в конфиге стоит true
     for source in ("tavily", "cryptopanic", "coinmarketcal"):
         if not cfg["keys"].get(source):

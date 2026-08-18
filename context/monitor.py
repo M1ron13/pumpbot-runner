@@ -18,8 +18,9 @@ import time
 from context import config as ctx_config
 from context.cache import Cache
 from context.matcher import TickerMatcher
+from context import signals
 from context.publisher import Publisher
-from context.sources import announcements, structural
+from context.sources import announcements, market, structural
 
 log = logging.getLogger("context.monitor")
 
@@ -87,6 +88,47 @@ async def poll_announcements(session, cfg: dict, cache: Cache, source: str) -> i
     log.info("%s: получено %s, новых %s, отфильтровано TradFi %s, без тикера %s",
              source, total, added, skipped, failed)
     return added
+
+
+async def poll_funding(session, cfg: dict, cache: Cache) -> int:
+    """Фандинг по всем символам → состояния с гистерезисом → внутренние события.
+
+    События FUNDING_EXTREME_* сознательно не входят в белый список публикатора: они
+    существуют только как строки внутри алерта пампа, самостоятельными сообщениями
+    не становятся.
+    """
+    if not cfg["signals"]["funding"]["enabled"]:
+        return 0
+    snapshot = await market.funding_snapshot(session, cfg)
+    if not snapshot:
+        return 0
+    now_ts = time.time()
+    ttl = float(cfg["monitor"]["event_ttl_sec"])
+    changes = 0
+    counts = {signals.FUNDING_LONG_EXTREME: 0, signals.FUNDING_SHORT_EXTREME: 0}
+    for symbol, data in snapshot.items():
+        funding_8h = signals.to_8h(data["rate"], data.get("interval_hours"))
+        previous = cache.signal_state(symbol, "funding")
+        state = signals.funding_transition(previous, funding_8h, cfg, now_ts)
+        cache.record_signal(symbol, "funding", state["state"], state["value"],
+                            state["since_ts"], sustained=state["sustained"],
+                            changed=state["changed"], now_ts=now_ts)
+        if state["state"] in counts:
+            counts[state["state"]] += 1
+        if state["changed"] and state["state"] != signals.FUNDING_OFF:
+            changes += 1
+            ticker = symbol[:-4] if symbol.endswith("USDT") else symbol
+            cache.add_event(
+                ts=now_ts, source="SIGNALS", event_type=f"FUNDING_EXTREME_"
+                f"{'LONG' if state['state'] == signals.FUNDING_LONG_EXTREME else 'SHORT'}",
+                raw_type="funding", ticker=ticker, symbol=symbol,
+                title=f"{symbol}: фандинг {state['value'] * 100:+.3f}%/8ч",
+                url="", payload={"value_8h": state["value"], "state": state["state"]},
+                ttl_sec=ttl, matched_rule="внутренний сигнал")
+    log.info("фандинг: символов %s, перегрев лонгов %s, перегрев шортов %s, переходов %s",
+             len(snapshot), counts[signals.FUNDING_LONG_EXTREME],
+             counts[signals.FUNDING_SHORT_EXTREME], changes)
+    return changes
 
 
 async def poll_instruments(session, cfg: dict, cache: Cache) -> int:
@@ -171,6 +213,11 @@ async def run_once(session, cfg: dict, cache: Cache) -> dict:
             stats["coinmarketcal"] = added
         except Exception as exc:
             log.warning("coinmarketcal: %s", exc)
+    if cfg["signals"]["funding"]["enabled"]:
+        try:
+            stats["фандинг"] = await poll_funding(session, cfg, cache)
+        except Exception as exc:
+            log.warning("фандинг: %s", exc)
     if cfg["publisher"]["enabled"]:
         try:
             telegram = await make_sender(session, cfg)
@@ -209,6 +256,9 @@ async def main_async(once: bool) -> int:
         if ctx_config.enabled(cfg, "instruments_diff"):
             tasks.append(loop_source("диффы инструментов", monitor["instruments_sec"],
                                      lambda: poll_instruments(session, cfg, cache)))
+        if cfg["signals"]["funding"]["enabled"]:
+            tasks.append(loop_source("фандинг", monitor["funding_sec"],
+                                     lambda: poll_funding(session, cfg, cache)))
         if cfg["publisher"]["enabled"]:
             sender = await make_sender(session, cfg)
             publisher = Publisher(cfg, cache, sender)

@@ -14,3 +14,4 @@ context_cache.db
 context_cache.db-wal
 context_cache.db-shm
 context_monitor.log
+.env

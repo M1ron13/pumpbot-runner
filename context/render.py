@@ -9,6 +9,8 @@
 
 from typing import Optional
 
+from context import signals
+
 VERDICT_CATALYST = "КАТАЛИЗАТОР"
 VERDICT_BEARISH = "МЕДВЕЖИЙ_ФОН"
 VERDICT_CLEAN = "ЧИСТО"
@@ -67,6 +69,19 @@ def render(context: dict, cfg: dict, now_ts: float) -> Optional[str]:
         lines.append(f"❔ Контекст не проверен ({failed})")
     else:
         lines.append("✅ Публичных новостей не найдено (инсайдерский катализатор не исключён)")
+
+    # риск сквоза идёт выше цифр: это про то, чем закончится шорт, а не про фон
+    squeeze = signals.squeeze_line(context.get("funding_state"), cfg)
+    if squeeze:
+        lines.append(squeeze)
+
+    basis = signals.basis_line(context.get("basis_pct"), context.get("basis_verdict"))
+    if basis:
+        lines.append(basis)
+
+    krw = signals.krw_line(context.get("krw_premium"), context.get("krw_background"), cfg)
+    if krw:
+        lines.append(krw)
 
     derivatives = context.get("derivatives") or {}
     if derivatives:

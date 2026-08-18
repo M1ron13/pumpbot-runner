@@ -126,3 +126,98 @@ async def dex(session, cfg: dict, ticker: str, addresses=None) -> Optional[dict]
         "pairs_found": len(collected),
         "matched_by": matched_by,
     }
+
+
+# --------------------------------------------------------------------------- #
+# данные для внутренних сигналов (пункты 1-3 пакета v2)
+# --------------------------------------------------------------------------- #
+
+async def spot_price(session, cfg: dict, symbol: str) -> Optional[float]:
+    """Спот-цена: Binance, при отказе — Bybit. Цена перпа берётся из самого алерта."""
+    try:
+        data = await _json(session, cfg["sources"]["binance_spot_price"].format(symbol=symbol),
+                           cfg["budget"]["per_source_ms"])
+        return float(data["price"])
+    except Exception:
+        pass
+    try:
+        data = await _json(session, cfg["sources"]["bybit_spot_price"].format(symbol=symbol),
+                           cfg["budget"]["per_source_ms"])
+        return float((data["result"]["list"] or [{}])[0]["lastPrice"])
+    except Exception:
+        return None
+
+
+async def spot_prices(session, cfg: dict, symbols) -> dict:
+    """Спот-цены нескольких символов одним запросом — для фона корейской премии."""
+    quoted = ",".join(f'"{s}"' for s in symbols)
+    try:
+        data = await _json(session, cfg["sources"]["binance_spot_prices"].format(symbols=quoted),
+                           cfg["budget"]["per_source_ms"])
+    except Exception:
+        return {}
+    out = {}
+    for item in data if isinstance(data, list) else []:
+        try:
+            out[item["symbol"]] = float(item["price"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+async def upbit_krw_prices(session, cfg: dict, tickers) -> dict:
+    """Цены в KRW по нескольким монетам одним запросом. Нет KRW-пары — нет ключа."""
+    markets = ",".join(f"KRW-{t}" for t in tickers)
+    try:
+        data = await _json(session, cfg["sources"]["upbit_ticker"].format(markets=markets),
+                           cfg["budget"]["per_source_ms"])
+    except Exception:
+        return {}
+    out = {}
+    for item in data if isinstance(data, list) else []:
+        market = str(item.get("market") or "")
+        if market.startswith("KRW-"):
+            try:
+                out[market[4:]] = float(item["trade_price"])
+            except (KeyError, TypeError, ValueError):
+                continue
+    return out
+
+
+async def usd_krw_rate(session, cfg: dict) -> Optional[float]:
+    try:
+        data = await _json(session, cfg["sources"]["usd_krw"], cfg["budget"]["per_source_ms"])
+        return float((data.get("rates") or {}).get("KRW"))
+    except Exception:
+        return None
+
+
+async def funding_snapshot(session, cfg: dict) -> dict:
+    """Фандинг по всем символам + интервал начисления, чтобы привести к 8 часам."""
+    out = {}
+    try:
+        rows = await _json(session, cfg["sources"]["binance_premium_index_all"],
+                           cfg["budget"]["per_source_ms"])
+        for item in rows if isinstance(rows, list) else []:
+            try:
+                out[item["symbol"]] = {"rate": float(item["lastFundingRate"]),
+                                       "interval_hours": None, "exchange": "BINANCE"}
+            except (KeyError, TypeError, ValueError):
+                continue
+    except Exception as exc:
+        log.warning("premiumIndex недоступен: %s", exc)
+
+    # интервалы: у части символов 4 часа вместо 8, и это меняет сравнение с порогом
+    try:
+        info = await _json(session, cfg["sources"]["binance_funding_info"],
+                           cfg["budget"]["per_source_ms"])
+        for item in info if isinstance(info, list) else []:
+            symbol = item.get("symbol")
+            if symbol in out:
+                try:
+                    out[symbol]["interval_hours"] = float(item["fundingIntervalHours"])
+                except (KeyError, TypeError, ValueError):
+                    pass
+    except Exception as exc:
+        log.debug("fundingInfo недоступен: %s", exc)
+    return out

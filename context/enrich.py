@@ -14,7 +14,7 @@ import time
 from typing import List, Optional
 
 from context import config as ctx_config
-from context import cross_listing, dedup, render
+from context import cross_listing, dedup, render, signals
 from context.cache import Cache
 from context.classify import Classifier
 from context.matcher import TickerMatcher
@@ -40,8 +40,49 @@ async def _guard(name: str, coro, timeout_ms: float, ok: list, failed: list):
     return None
 
 
+
+async def basis_context(session, cfg: dict, symbol: str, perp_price: float) -> dict:
+    """Basis: цена перпа уже известна из алерта, поэтому нужен один запрос спота."""
+    spot = await market.spot_price(session, cfg, symbol)
+    basis = signals.basis_pct(perp_price, spot)
+    verdict = signals.basis_verdict(basis, cfg)
+    if basis is not None and verdict is None and not signals.basis_is_sane(basis, cfg):
+        log.warning("basis по %s = %.1f%% — цены несопоставимы, строка не печатается",
+                    symbol, basis)
+    return {"basis_pct": basis, "basis_verdict": verdict, "spot_price": spot}
+
+
+async def krw_context(session, cfg: dict, cache, ticker: str, usd_price: float) -> dict:
+    """Корейская премия к фону рынка: премия монеты минус медиана мажоров."""
+    krw_cfg = cfg["signals"]["krw"]
+    majors = list(krw_cfg["background_tickers"])
+
+    rate = cache.get_state("usd_krw")
+    rate_ts = float(cache.get_state("usd_krw_ts") or 0)
+    if not rate or time.time() - rate_ts > float(krw_cfg["fx_cache_sec"]):
+        fetched = await market.usd_krw_rate(session, cfg)
+        if fetched:
+            rate = fetched
+            cache.set_state("usd_krw", rate)
+            cache.set_state("usd_krw_ts", time.time())
+    if not rate:
+        return {}
+
+    krw_prices = await market.upbit_krw_prices(session, cfg, [ticker] + majors)
+    if ticker not in krw_prices:
+        return {}          # монета не торгуется на Upbit — строки просто нет
+    usd_prices = await market.spot_prices(session, cfg, [f"{m}USDT" for m in majors])
+
+    background = signals.market_background({
+        m: signals.krw_premium_pct(krw_prices.get(m), rate, usd_prices.get(f"{m}USDT"))
+        for m in majors})
+    premium = signals.krw_premium_pct(krw_prices.get(ticker), rate, usd_price)
+    return {"krw_premium": premium, "krw_background": background,
+            "krw_excess": signals.excess_premium(premium, background)}
+
+
 async def collect(session, cfg: dict, cache: Cache, *, ticker: str, symbol: str,
-                  now_ts: float, unlock_text: str = None) -> dict:
+                  now_ts: float, unlock_text: str = None, price: float = None) -> dict:
     """Собрать контекст в пределах бюджета. Возвращает словарь для render.render()."""
     ok: List[str] = []
     failed: List[str] = []
@@ -76,6 +117,12 @@ async def collect(session, cfg: dict, cache: Cache, *, ticker: str, symbol: str,
             addresses = []
         tasks["DEX"] = _guard("DEX", market.dex(session, cfg, ticker, addresses),
                               per_source, ok, failed)
+    if cfg["signals"]["basis"]["enabled"] and price:
+        tasks["basis"] = _guard("basis", basis_context(session, cfg, symbol, price),
+                                per_source, ok, failed)
+    if cfg["signals"]["krw"]["enabled"] and price:
+        tasks["KRW"] = _guard("KRW", krw_context(session, cfg, cache, ticker, price),
+                              per_source, ok, failed)
     if ctx_config.enabled(cfg, "tavily"):
         tasks["tavily"] = _guard("tavily", news.tavily(session, cfg, ticker), per_source, ok, failed)
     if ctx_config.enabled(cfg, "cryptopanic"):
@@ -89,6 +136,16 @@ async def collect(session, cfg: dict, cache: Cache, *, ticker: str, symbol: str,
                    for name, value in zip(tasks.keys(), gathered)}
 
     context["derivatives"] = results.get("деривативы") or {}
+    context.update(results.get("basis") or {})
+    context.update(results.get("KRW") or {})
+    # состояние фандинга читается из кэша бесплатно — его собирает контур A
+    funding_state = cache.signal_state(symbol, "funding")
+    if funding_state:
+        sustained_sec = float(cfg["signals"]["funding"]["sustained_hours"]) * 3600.0
+        context["funding_state"] = {
+            "state": funding_state["state"], "value": funding_state["value"],
+            "sustained": (funding_state["state"] == signals.FUNDING_SHORT_EXTREME
+                          and now_ts - float(funding_state["since_ts"] or now_ts) >= sustained_sec)}
     context["dex"] = results.get("DEX") or {}
     if unlock_text:
         context["unlock"] = unlock_text
@@ -179,7 +236,7 @@ async def enrich_alert(alert, bot_cfg: dict, session=None, cfg: dict = None,
 
         context = await asyncio.wait_for(
             collect(session, cfg, cache, ticker=ticker, symbol=sig.symbol,
-                    now_ts=now_ts, unlock_text=sig.event_context),
+                    now_ts=now_ts, unlock_text=sig.event_context, price=sig.price),
             timeout=budget_ms / 1000.0)
         block = render.render(context, cfg, now_ts)
         cache.log_enrichment(symbol=sig.symbol, verdict=context.get("verdict"), block=block,

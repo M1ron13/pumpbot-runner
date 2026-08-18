@@ -90,6 +90,30 @@ CREATE TABLE IF NOT EXISTS enrichments (
     sources_failed TEXT
 );
 
+CREATE TABLE IF NOT EXISTS signal_state (
+    symbol TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    state TEXT NOT NULL,
+    value REAL,
+    since_ts REAL,
+    updated_ts REAL,
+    PRIMARY KEY (symbol, kind)
+);
+
+-- Историю переходов перезаписывать нельзя: без временного ряда состояний бэктест
+-- слоя не сможет проверить, есть ли у этих сигналов предсказательная сила.
+CREATE TABLE IF NOT EXISTS signal_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    symbol TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    state_from TEXT,
+    state_to TEXT,
+    value REAL,
+    sustained INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_signal_history_symbol ON signal_history(symbol, kind, ts);
+
 CREATE TABLE IF NOT EXISTS published (
     source TEXT NOT NULL,
     external_id TEXT NOT NULL,
@@ -299,6 +323,55 @@ class Cache:
              kwargs.get("block"), kwargs.get("budget_ms"), kwargs.get("elapsed_ms"),
              ",".join(kwargs.get("sources_ok") or []), ",".join(kwargs.get("sources_failed") or [])))
         self.conn.commit()
+
+    # -- состояния внутренних сигналов ---------------------------------------- #
+
+    def signal_state(self, symbol: str, kind: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM signal_state WHERE symbol = ? AND kind = ?", (symbol, kind)).fetchone()
+        return dict(row) if row else None
+
+    def record_signal(self, symbol: str, kind: str, state: str, value: float,
+                      since_ts: float, sustained: bool = False, changed: bool = False,
+                      now_ts: float = None) -> None:
+        """Текущее состояние + запись перехода в историю.
+
+        Текущее состояние перезаписывается (оно про «сейчас»), а переход добавляется
+        в `signal_history` — этот ряд и есть материал для бэктеста слоя.
+        """
+        now_ts = now_ts if now_ts is not None else time.time()
+        previous = self.signal_state(symbol, kind)
+        self.conn.execute(
+            "INSERT INTO signal_state (symbol, kind, state, value, since_ts, updated_ts)"
+            " VALUES (?,?,?,?,?,?) ON CONFLICT(symbol, kind) DO UPDATE SET"
+            " state = excluded.state, value = excluded.value,"
+            " since_ts = excluded.since_ts, updated_ts = excluded.updated_ts",
+            (symbol, kind, state, value, since_ts, now_ts))
+        if changed or previous is None:
+            self.conn.execute(
+                "INSERT INTO signal_history (ts, symbol, kind, state_from, state_to, value,"
+                " sustained) VALUES (?,?,?,?,?,?,?)",
+                (now_ts, symbol, kind, (previous or {}).get("state"), state, value,
+                 1 if sustained else 0))
+        self.conn.commit()
+
+    def signal_history(self, symbol: str = None, kind: str = None, limit: int = 200) -> list:
+        sql = "SELECT * FROM signal_history WHERE 1=1"
+        params = []
+        if symbol:
+            sql += " AND symbol = ?"
+            params.append(symbol)
+        if kind:
+            sql += " AND kind = ?"
+            params.append(kind)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        return [dict(r) for r in self.conn.execute(sql, params)]
+
+    def active_signals(self, kind: str, state: str) -> list:
+        rows = self.conn.execute(
+            "SELECT * FROM signal_state WHERE kind = ? AND state = ?", (kind, state))
+        return [dict(r) for r in rows]
 
     # -- сквозной дедуп отправок ---------------------------------------------- #
 

@@ -380,6 +380,12 @@ class Publisher:
                 stats["в лог"] += 1
                 log.info("не отправлено [%s] %s %s — %s", event.get("source"),
                          event.get("event_type"), event.get("ticker") or "?", label)
+                # в журнал решений идут и отказы до сборки сообщения: иначе аудит
+                # видит только то, что дошло до guard-цепочки
+                self._journal(Message(type="—", ticker=event.get("ticker"),
+                                      source=str(event.get("source") or ""),
+                                      external_id=str(event.get("url") or ""),
+                                      text=str(event.get("title") or "")), label, now_ts)
                 continue
             sent, label = await self.publish(message, now_ts)
             self.mark_event(event["id"], now_ts,

@@ -19,7 +19,8 @@
     "event_ttl_sec": 172800,
     "kucoin_sec": 60,
     "publisher_sec": 60,
-    "publish_ledger_sec": 2592000
+    "publish_ledger_sec": 2592000,
+    "funding_sec": 300
   },
   "sources": {
     "bybit_announcements": "https://api.bybit.com/v5/announcements/index?locale=en-US&limit=50",
@@ -43,7 +44,15 @@
     "tavily_search": "https://api.tavily.com/search",
     "coinmarketcal_events": "https://developers.coinmarketcal.com/v1/events",
     "dexscreener_tokens": "https://api.dexscreener.com/latest/dex/tokens/{address}",
-    "kucoin_announcements": "https://www.kucoin.com/_api/cms/articles?page=1&pageSize=20&category=listing&lang=en_US"
+    "kucoin_announcements": "https://www.kucoin.com/_api/cms/articles?page=1&pageSize=20&category=listing&lang=en_US",
+    "binance_spot_price": "https://api.binance.com/api/v3/ticker/price?symbol={symbol}",
+    "binance_spot_prices": "https://api.binance.com/api/v3/ticker/price?symbols=[{symbols}]",
+    "bybit_spot_price": "https://api.bybit.com/v5/market/tickers?category=spot&symbol={symbol}",
+    "upbit_ticker": "https://api.upbit.com/v1/ticker?markets={markets}",
+    "upbit_markets": "https://api.upbit.com/v1/market/all",
+    "usd_krw": "https://open.er-api.com/v6/latest/USD",
+    "binance_premium_index_all": "https://fapi.binance.com/fapi/v1/premiumIndex",
+    "binance_funding_info": "https://fapi.binance.com/fapi/v1/fundingInfo"
   },
   "enabled_sources": {
     "bybit_announcements": true,
@@ -233,7 +242,7 @@
   },
   "publisher": {
     "_комментарий": "Белый список: отправить можно только перечисленные типы. Новый тип или новый источник добавляется ТОЛЬКО с режимом тени, снимается вручную после просмотра ретро-таблицы владельцем.",
-    "enabled": false,
+    "enabled": true,
     "shadow_types": [
       "MAJOR_NEWS"
     ],
@@ -245,6 +254,34 @@
       "min_confirmations": 2,
       "max_per_day": 5,
       "over_limit_min_confidence": 0.9
+    }
+  },
+  "signals": {
+    "_комментарий": "Внутренние сигналы: только строки внутри PUMP_ALERT, в канал сами не идут.",
+    "funding": {
+      "enabled": true,
+      "poll_sec": 300,
+      "extreme_pos": 0.0015,
+      "release_pos": 0.001,
+      "extreme_neg": -0.001,
+      "release_neg": -0.0006,
+      "sustained_hours": 24
+    },
+    "basis": {
+      "enabled": true,
+      "hot_pct": 0.8,
+      "cold_pct": -0.5,
+      "max_abs_pct": 20.0
+    },
+    "krw": {
+      "enabled": true,
+      "excess_pct": 3.0,
+      "background_tickers": [
+        "BTC",
+        "ETH"
+      ],
+      "fx_cache_sec": 3600,
+      "markets_cache_sec": 86400
     }
   }
 }
