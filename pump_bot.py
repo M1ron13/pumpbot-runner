@@ -152,10 +152,16 @@ class Snapshot:
 
 @dataclass
 class Candle:
-    """Минутная свеча: время открытия (сек), закрытие, quote volume."""
+    """Минутная свеча: время открытия (сек), закрытие, quote volume.
+
+    high/low добавлены с значениями по умолчанию — они нужны только для замера
+    экстремумов окна (MAE/MFE), а backfill работает по закрытиям.
+    """
     ts: float
     close: float
     quote_volume: float
+    high: float = 0.0
+    low: float = 0.0
 
 
 @dataclass
@@ -929,6 +935,53 @@ class Feed:
         out.sort(key=lambda c: c.ts)
         return out or None
 
+    async def klines_range(self, exchange: str, symbol: str, start_ts: float,
+                          end_ts: float) -> Optional[List[Candle]]:
+        """Свечи за окно [start, end] с high/low — для замера экстремумов после сигнала.
+
+        Интервал выбирается по длине окна: до 4 часов — минутные (точность до минуты),
+        для суток — пятиминутные. Причина не в лени, а в лимитах: сутки минутных свечей
+        это 1440 бар, у Bybit предел 1000 за запрос, и пагинация ради точности, которая
+        на суточном горизонте не меняет вывод, не оправдана.
+        """
+        window_sec = max(60.0, end_ts - start_ts)
+        if exchange == "BINANCE":
+            interval = "1m" if window_sec <= 4 * 3600 else "5m"
+            url = self.net["binance_klines_range_url"].format(
+                symbol=symbol, interval=interval,
+                start=int(start_ts * 1000), end=int(end_ts * 1000))
+            data = await self.get_json("binance/klines_range", url)
+            if not isinstance(data, list):
+                return None
+            out = []
+            for item in data:
+                try:
+                    out.append(Candle(ts=float(item[0]) / 1000.0, close=float(item[4]),
+                                      quote_volume=float(item[7]),
+                                      high=float(item[2]), low=float(item[3])))
+                except (IndexError, TypeError, ValueError):
+                    continue
+            return out or None
+
+        interval = "1" if window_sec <= 4 * 3600 else "5"
+        url = self.net["bybit_klines_range_url"].format(
+            symbol=symbol, interval=interval,
+            start=int(start_ts * 1000), end=int(end_ts * 1000))
+        data = await self.get_json("bybit/klines_range", url)
+        rows = (data or {}).get("result", {}).get("list") if isinstance(data, dict) else None
+        if not rows:
+            return None
+        out = []
+        for item in rows:
+            try:
+                out.append(Candle(ts=float(item[0]) / 1000.0, close=float(item[4]),
+                                  quote_volume=float(item[6]),
+                                  high=float(item[2]), low=float(item[3])))
+            except (IndexError, TypeError, ValueError):
+                continue
+        out.sort(key=lambda c: c.ts)
+        return out or None
+
     async def candles_15m(self, exchange: str, symbol: str, limit: int) -> Optional[List[Candle]]:
         """15-минутные свечи — для детектора истощения."""
         if exchange == "BINANCE":
@@ -1186,6 +1239,32 @@ def write_state_file(path: str, data: dict) -> bool:
 # слой 5: журнал сигналов и исходов (+1ч / +4ч / +24ч)
 # --------------------------------------------------------------------------- #
 
+def excursions(candles: List[Candle], entry_price: float) -> Optional[dict]:
+    """Максимальный ход против шорта и в его пользу внутри окна.
+
+    Без этого бэктест систематически завышает результат: сигнал, где цена сначала
+    ушла на 15% вверх (стоп бы вынесло), а к концу горизонта вернулась к −1%,
+    по одной конечной точке выглядит почти нейтральным.
+
+    MAE (adverse) для шорта — максимум цены: положительное число, «настолько было
+    против нас». MFE (favourable) — минимум цены: отрицательное число, «настолько
+    было в нашу пользу».
+    """
+    if not candles or not entry_price or entry_price <= 0:
+        return None
+    highs = [c.high for c in candles if c.high]
+    lows = [c.low for c in candles if c.low]
+    if not highs or not lows:
+        return None
+    max_price, min_price = max(highs), min(lows)
+    return {
+        "max_price": max_price,
+        "min_price": min_price,
+        "mae_pct": (max_price - entry_price) / entry_price * 100.0,
+        "mfe_pct": (min_price - entry_price) / entry_price * 100.0,
+    }
+
+
 class SignalJournal:
     """SQLite-журнал: каждый алерт и что с ценой стало через 1, 4 и 24 часа.
 
@@ -1217,6 +1296,8 @@ class SignalJournal:
             dex_volume_h24 REAL, dex_price_change_h1 REAL, dex_pair TEXT,
             context_verdict TEXT, context_sources_failed TEXT, context_block TEXT,
             price_1h REAL, price_4h REAL, price_24h REAL,
+            -- экстремумы окна: конечная точка без них завышает результат
+            mae_1h REAL, mfe_1h REAL, mae_4h REAL, mfe_4h REAL, mae_24h REAL, mfe_24h REAL,
             out_1h REAL, out_4h REAL, out_24h REAL
         )
     """
@@ -1232,6 +1313,8 @@ class SignalJournal:
         ("context_verdict", "TEXT"), ("context_sources_failed", "TEXT"),
         ("context_block", "TEXT"),
         ("price_1h", "REAL"), ("price_4h", "REAL"), ("price_24h", "REAL"),
+        ("mae_1h", "REAL"), ("mfe_1h", "REAL"), ("mae_4h", "REAL"), ("mfe_4h", "REAL"),
+        ("mae_24h", "REAL"), ("mfe_24h", "REAL"),
     )
     HORIZONS = (("out_1h", 3600.0), ("out_4h", 14400.0), ("out_24h", 86400.0))
 
@@ -1317,19 +1400,50 @@ class SignalJournal:
             (change, price_now, row_id))
         self.conn.commit()
 
-    def report(self) -> str:
+    def fill_excursions(self, row_id: int, column: str, values: dict) -> None:
+        """Экстремумы горизонта. column — это out_1h/out_4h/out_24h."""
+        suffix = column.replace("out_", "")
+        self.conn.execute(
+            f"UPDATE signals SET mae_{suffix} = ?, mfe_{suffix} = ? WHERE id = ?",
+            (values.get("mae_pct"), values.get("mfe_pct"), row_id))
+        self.conn.commit()
+
+    def report(self, stop_levels=(5.0, 10.0, 15.0)) -> str:
+        """Сводка. Средний результат показывается рядом с максимальным ходом ПРОТИВ,
+        иначе видно только выживших: сигнал со просадкой 15% и возвратом к нулю в
+        колонке «средняя» выглядит безобидным."""
         rows = self.conn.execute(
-            """SELECT kind, COALESCE(oi_read, 'FLAT'), COUNT(*),
-                      AVG(out_1h), AVG(out_4h), AVG(out_24h),
-                      SUM(CASE WHEN out_24h < 0 THEN 1 ELSE 0 END)
-               FROM signals GROUP BY kind, oi_read ORDER BY kind, oi_read"""
+            """SELECT kind, COALESCE(oi_read, 'FLAT') AS oi, COUNT(*) AS n,
+                      AVG(out_1h) AS a1, AVG(out_4h) AS a4, AVG(out_24h) AS a24,
+                      AVG(mae_1h) AS mae1, MAX(mae_1h) AS mae_max,
+                      AVG(mfe_1h) AS mfe1,
+                      SUM(CASE WHEN out_24h < 0 THEN 1 ELSE 0 END) AS down
+               FROM signals GROUP BY kind, oi ORDER BY kind, oi"""
         ).fetchall()
-        lines = [f"{'ТИП':9}{'OI':11}{'N':>4}{'ср.1ч%':>9}{'ср.4ч%':>9}{'ср.24ч%':>9}{'ушло вниз':>11}"]
-        for kind, oi, count, a1, a4, a24, down in rows:
-            def num(v):
-                return f"{v:>9.2f}" if v is not None else f"{'—':>9}"
-            share = f"{(down or 0) / count:.0%}" if count else "—"
-            lines.append(f"{kind:9}{oi:11}{count:>4}{num(a1)}{num(a4)}{num(a24)}{share:>11}")
+
+        def num(value, width=9, digits=2):
+            return f"{value:>{width}.{digits}f}" if value is not None else f"{'—':>{width}}"
+
+        lines = [f"{'ТИП':9}{'OI':11}{'N':>4}{'ср.1ч%':>9}{'ср.4ч%':>9}{'ср.24ч%':>9}"
+                 f"{'ср.MAE%':>9}{'макс.MAE%':>11}{'ср.MFE%':>9}{'вниз':>7}"]
+        for row in rows:
+            share = f"{(row['down'] or 0) / row['n']:.0%}" if row["n"] else "—"
+            lines.append(f"{row['kind']:9}{row['oi']:11}{row['n']:>4}"
+                         f"{num(row['a1'])}{num(row['a4'])}{num(row['a24'])}"
+                         f"{num(row['mae1'])}{num(row['mae_max'], 11)}{num(row['mfe1'])}"
+                         f"{share:>7}")
+
+        # сколько сигналов вынесло бы стопом на разных уровнях
+        total = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM signals WHERE mae_1h IS NOT NULL").fetchone()["n"]
+        if total:
+            lines.append("")
+            lines.append(f"стоп вынесло бы (по максимальному ходу против позиции, окно 1ч), "
+                         f"замеров {total}:")
+            for level in stop_levels:
+                hit = self.conn.execute(
+                    "SELECT COUNT(*) AS n FROM signals WHERE mae_1h >= ?", (level,)).fetchone()["n"]
+                lines.append(f"   стоп {level:>4.0f}% → {hit:>3} из {total} ({hit / total:.0%})")
         return chr(10).join(lines)
 
 
@@ -1584,13 +1698,28 @@ class PumpBot:
         except Exception as exc:
             log.error("журнал не опрошен: %s", exc)
             return
+        horizons = dict(SignalJournal.HORIZONS)
         for row_id, exchange, symbol, price_then, column in due:
             price_now = await feed.price(exchange, symbol)
             if price_now is None:
                 continue
             self.journal.fill(row_id, column, price_now, price_then)
-            log.info("исход %s %s: %s = %+.2f%%", exchange, symbol, column,
-                     (price_now - price_then) / price_then * 100.0)
+
+            # экстремумы окна: конечная точка не показывает, вынесло бы стопом
+            signal_ts = self.journal.conn.execute(
+                "SELECT ts FROM signals WHERE id = ?", (row_id,)).fetchone()
+            extremes = None
+            if signal_ts is not None:
+                start = float(signal_ts["ts"])
+                candles = await feed.klines_range(exchange, symbol, start,
+                                                  start + horizons.get(column, 3600.0))
+                extremes = excursions(candles or [], price_then)
+                if extremes:
+                    self.journal.fill_excursions(row_id, column, extremes)
+            log.info("исход %s %s: %s = %+.2f%%%s", exchange, symbol, column,
+                     (price_now - price_then) / price_then * 100.0,
+                     f" | против позиции {extremes['mae_pct']:+.2f}%, "
+                     f"в пользу {extremes['mfe_pct']:+.2f}%" if extremes else "")
 
     def startup_message(self) -> str:
         cfg = self.cfg

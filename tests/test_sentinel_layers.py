@@ -341,5 +341,81 @@ class AlertSubtypeGovernanceTestCase(unittest.TestCase):
         self.assertTrue(kinds <= set(PUMP_ALERT_SUBTYPES),
                         f"необъявленные подтипы в коде: {kinds - set(PUMP_ALERT_SUBTYPES)}")
 
+
+class ExcursionTestCase(unittest.TestCase):
+    """MAE/MFE: без максимального хода против позиции бэктест завышает результат."""
+
+    def bars(self, prices):
+        """Свечи из троек (high, low, close)."""
+        return [pump_bot.Candle(ts=START_TS + i * 60, close=c, quote_volume=1000.0,
+                                high=h, low=l)
+                for i, (h, l, c) in enumerate(prices)]
+
+    def test_case_from_owner_dip_then_recovery(self):
+        """Цена ушла на 15% против шорта и вернулась к −1%: конечная точка обманывает."""
+        candles = self.bars([(115.0, 99.0, 114.0), (114.0, 98.0, 100.0), (100.0, 98.0, 99.0)])
+        result = pump_bot.excursions(candles, entry_price=100.0)
+        self.assertAlmostEqual(result["mae_pct"], 15.0, places=6)
+        self.assertAlmostEqual(result["mfe_pct"], -2.0, places=6)
+        self.assertAlmostEqual(result["max_price"], 115.0)
+        self.assertAlmostEqual(result["min_price"], 98.0)
+
+    def test_signs_are_direction_aware(self):
+        """MAE положительный (против шорта), MFE отрицательный (в пользу шорта)."""
+        result = pump_bot.excursions(self.bars([(101.0, 90.0, 92.0)]), entry_price=100.0)
+        self.assertGreater(result["mae_pct"], 0)
+        self.assertLess(result["mfe_pct"], 0)
+
+    def test_no_data_is_safe(self):
+        self.assertIsNone(pump_bot.excursions([], 100.0))
+        self.assertIsNone(pump_bot.excursions(self.bars([(1.0, 1.0, 1.0)]), 0))
+        # свечи без high/low (backfill-путь) не должны давать выдуманные экстремумы
+        flat = [pump_bot.Candle(ts=START_TS, close=100.0, quote_volume=10.0)]
+        self.assertIsNone(pump_bot.excursions(flat, 100.0))
+
+
+class ExcursionJournalTestCase(unittest.TestCase):
+    """Экстремумы попадают в журнал и в отчёт вместе с оценкой выносов стопом."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="mae-")
+        self.journal = pump_bot.SignalJournal(os.path.join(self.tmpdir, "signals.db"))
+
+    def tearDown(self):
+        self.journal.close()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def add(self, symbol="XYZUSDT", price=100.0):
+        signal = pump_bot.Signal(exchange="BINANCE", symbol=symbol, triggers=["MAIN"],
+                                 move_15m=9.0, move_5m=7.0, zscore=8.0, vol_mult=6.0,
+                                 price=price, volume_24h=5e7, funding_rate=None, ts=START_TS,
+                                 oi_read="SQUEEZE")
+        return self.journal.record(pump_bot.Alert(symbol=symbol, exchanges=["BINANCE"],
+                                                 primary=signal, ts=START_TS))
+
+    def test_excursions_are_stored_per_horizon(self):
+        row_id = self.add()
+        self.journal.fill(row_id, "out_1h", price_now=99.0, price_then=100.0)
+        self.journal.fill_excursions(row_id, "out_1h", {"mae_pct": 15.0, "mfe_pct": -2.0})
+        row = dict(self.journal.conn.execute(
+            "SELECT out_1h, mae_1h, mfe_1h FROM signals WHERE id = ?", (row_id,)).fetchone())
+        self.assertAlmostEqual(row["out_1h"], -1.0)
+        self.assertAlmostEqual(row["mae_1h"], 15.0)
+        self.assertAlmostEqual(row["mfe_1h"], -2.0)
+
+    def test_report_shows_mae_and_stop_hits(self):
+        quiet = self.add(symbol="QUIETUSDT")
+        violent = self.add(symbol="VIOLENTUSDT")
+        for row_id, out, mae in ((quiet, -6.0, 2.0), (violent, -1.0, 15.0)):
+            self.journal.fill(row_id, "out_1h", price_now=100.0 + out, price_then=100.0)
+            self.journal.fill_excursions(row_id, "out_1h", {"mae_pct": mae, "mfe_pct": -7.0})
+
+        report = self.journal.report(stop_levels=(5.0, 10.0))
+        self.assertIn("ср.MAE%", report)
+        self.assertIn("макс.MAE%", report)
+        self.assertIn("стоп вынесло бы", report)
+        self.assertIn("стоп    5% →   1 из 2 (50%)", report)
+        self.assertIn("стоп   10% →   1 из 2 (50%)", report)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
