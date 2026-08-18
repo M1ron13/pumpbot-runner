@@ -10,6 +10,8 @@ import re
 import time
 from typing import List
 
+from context import listing_rules as rules
+
 log = logging.getLogger("context.announcements")
 
 # Тип берём из данных источника, не переклассифицируем.
@@ -156,9 +158,54 @@ async def okx(session, cfg: dict) -> List[dict]:
     return out
 
 
+async def kucoin(session, cfg: dict) -> List[dict]:
+    """KuCoin: единственный источник, который раньше был только в старом пайплайне."""
+    data = await _json(session, cfg["sources"]["kucoin_announcements"],
+                       cfg["budget"]["per_source_ms"],
+                       headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+    items = ((data.get("items") or (data.get("data") or {}).get("items"))
+             if isinstance(data, dict) else None) or []
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title") or ""
+        event_type = "DELISTING" if BINANCE_DELIST_RE.search(title) else "LISTING"
+        published = item.get("publish_ts") or item.get("createdAt") or 0
+        try:
+            ts = float(published) / 1000.0 if float(published) > 1e11 else float(published)
+        except (TypeError, ValueError):
+            ts = time.time()
+        out.append({"source": "KUCOIN", "raw_type": "cms", "event_type": event_type,
+                    "title": title, "url": item.get("path") or item.get("url") or "",
+                    "ts": ts or time.time(), "tags": []})
+    return out
+
+
+def screen(item: dict, cfg: dict) -> dict:
+    """Единый входной фильтр для любого источника анонсов.
+
+    Инструменты на акции и объявления без тикера дальше кэша не идут: именно их
+    отсутствие в одном из пайплайнов и дало инцидент со спамом.
+    """
+    listing_cfg = rules.load_config()
+    title = item.get("title") or ""
+    kind = rules.classify_instrument_kind(title, listing_cfg, item.get("raw_type"))
+    if kind == "tradfi":
+        return {"keep": False, "stage": "filtered_tradfi", "tickers": [],
+                "reason": "инструмент на акции — не крипто-событие"}
+    tickers = rules.extract_tickers(title, listing_cfg)
+    if not tickers:
+        return {"keep": False, "stage": "parse_failed", "tickers": [],
+                "reason": "тикер не извлечён"}
+    return {"keep": True, "stage": "ок", "tickers": tickers,
+            "market": rules.market_kind(title), "reason": ""}
+
+
 FETCHERS = {
     "bybit_announcements": bybit,
     "binance_announcements": binance,
     "upbit_announcements": upbit,
     "okx_announcements": okx,
+    "kucoin_announcements": kucoin,
 }

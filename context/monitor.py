@@ -11,12 +11,14 @@
 import argparse
 import asyncio
 import logging
+import os
 import sys
 import time
 
 from context import config as ctx_config
 from context.cache import Cache
 from context.matcher import TickerMatcher
+from context.publisher import Publisher
 from context.sources import announcements, structural
 
 log = logging.getLogger("context.monitor")
@@ -51,21 +53,39 @@ async def refresh_coins(session, cfg: dict, cache: Cache) -> int:
 
 
 async def poll_announcements(session, cfg: dict, cache: Cache, source: str) -> int:
-    """Один источник объявлений → события в кэш. Тикер ищется правилами матчинга."""
+    """Один источник объявлений → события в кэш, через единый входной фильтр.
+
+    TradFi-инструменты и объявления без тикера в кэш не попадают: иначе они дойдут
+    до вердикта КАТАЛИЗАТОР в алертах пампа или до канала.
+    """
     fetcher = announcements.FETCHERS[source]
     items = await fetcher(session, cfg)
-    matcher = TickerMatcher(cfg, cache)
     ttl = float(cfg["monitor"]["event_ttl_sec"])
-    added = 0
+    added = skipped = failed = 0
     for item in items:
-        match = matcher.match(item["title"], item["source"])
+        screened = announcements.screen(item, cfg)
+        if not screened["keep"]:
+            if screened["stage"] == "filtered_tradfi":
+                skipped += 1
+                log.info("[filtered_tradfi] %s | %s", item["source"], item["title"][:110])
+            else:
+                failed += 1
+                log.info("[parse_failed] %s | %s | %s", item["source"],
+                         item["title"][:110], item.get("url", ""))
+            continue
         added += int(cache.add_event(
             ts=item["ts"], source=item["source"], event_type=item["event_type"],
-            raw_type=item.get("raw_type"), ticker=(match or {}).get("ticker"),
+            raw_type=item.get("raw_type"), ticker=screened["tickers"][0],
             symbol=None, title=item["title"], url=item.get("url"),
-            payload={"tags": item.get("tags") or []}, ttl_sec=ttl,
-            matched_rule=(match or {}).get("rule")))
-    log.info("%s: получено %s, новых %s", source, len(items), added)
+            payload={"tags": item.get("tags") or [], "tickers": screened["tickers"],
+                     "market": screened.get("market")},
+            ttl_sec=ttl, matched_rule="фильтр листингов"))
+    total = len(items)
+    if total >= 10 and failed / total > 0.3:
+        log.warning("%s: тикер не извлекается у %.0f%% объявлений (%s/%s) — парсер деградировал",
+                    source, failed / total * 100, failed, total)
+    log.info("%s: получено %s, новых %s, отфильтровано TradFi %s, без тикера %s",
+             source, total, added, skipped, failed)
     return added
 
 
@@ -99,14 +119,32 @@ async def loop_source(name: str, interval_sec: float, coro_factory) -> None:
         await asyncio.sleep(max(1.0, interval_sec - elapsed))
 
 
+async def make_sender(session, cfg: dict):
+    """Отправка через боевой Telegram-клиент бота — один клиент, один формат, один канал."""
+    import sys
+    bot_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if bot_dir not in sys.path:
+        sys.path.insert(0, bot_dir)
+    import pump_bot
+    bot_cfg_path = os.path.join(bot_dir, "config.local.json")
+    if not os.path.exists(bot_cfg_path):
+        bot_cfg_path = os.path.join(bot_dir, "config.json")
+    telegram = pump_bot.Telegram(pump_bot.load_config(bot_cfg_path), session)
+
+    async def send(text: str) -> bool:
+        return await telegram.send(text)
+
+    return send
+
+
 async def run_once(session, cfg: dict, cache: Cache) -> dict:
     stats = {}
     try:
         stats["coins"] = await refresh_coins(session, cfg, cache)
     except Exception as exc:
         log.warning("справочник монет: %s", exc)
-    for source in ("bybit_announcements", "binance_announcements",
-                   "upbit_announcements", "okx_announcements"):
+    for source in ("bybit_announcements", "binance_announcements", "upbit_announcements",
+                   "kucoin_announcements", "okx_announcements"):
         if not ctx_config.enabled(cfg, source):
             continue
         try:
@@ -133,7 +171,13 @@ async def run_once(session, cfg: dict, cache: Cache) -> dict:
             stats["coinmarketcal"] = added
         except Exception as exc:
             log.warning("coinmarketcal: %s", exc)
-    cache.purge_expired()
+    if cfg["publisher"]["enabled"]:
+        try:
+            telegram = await make_sender(session, cfg)
+            stats["публикатор"] = await Publisher(cfg, cache, telegram).run_once()
+        except Exception as exc:
+            log.warning("публикатор: %s", exc)
+    cache.purge_expired(ledger_sec=float(cfg['monitor']['publish_ledger_sec']))
     return stats
 
 
@@ -165,6 +209,11 @@ async def main_async(once: bool) -> int:
         if ctx_config.enabled(cfg, "instruments_diff"):
             tasks.append(loop_source("диффы инструментов", monitor["instruments_sec"],
                                      lambda: poll_instruments(session, cfg, cache)))
+        if cfg["publisher"]["enabled"]:
+            sender = await make_sender(session, cfg)
+            publisher = Publisher(cfg, cache, sender)
+            tasks.append(loop_source("публикатор", monitor["publisher_sec"],
+                                     publisher.run_once))
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:

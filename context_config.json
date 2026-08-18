@@ -16,7 +16,10 @@
     "unlocks_sec": 3600,
     "coinmarketcal_sec": 3600,
     "coins_dictionary_sec": 86400,
-    "event_ttl_sec": 172800
+    "event_ttl_sec": 172800,
+    "kucoin_sec": 60,
+    "publisher_sec": 60,
+    "publish_ledger_sec": 2592000
   },
   "sources": {
     "bybit_announcements": "https://api.bybit.com/v5/announcements/index?locale=en-US&limit=50",
@@ -39,7 +42,8 @@
     "cryptopanic_posts": "https://cryptopanic.com/api/v1/posts/?auth_token={token}&currencies={ticker}&public=true",
     "tavily_search": "https://api.tavily.com/search",
     "coinmarketcal_events": "https://developers.coinmarketcal.com/v1/events",
-    "dexscreener_tokens": "https://api.dexscreener.com/latest/dex/tokens/{address}"
+    "dexscreener_tokens": "https://api.dexscreener.com/latest/dex/tokens/{address}",
+    "kucoin_announcements": "https://www.kucoin.com/_api/cms/articles?page=1&pageSize=20&category=listing&lang=en_US"
   },
   "enabled_sources": {
     "bybit_announcements": true,
@@ -54,7 +58,8 @@
     "tavily": false,
     "cryptopanic": false,
     "arkham": false,
-    "coinglass": false
+    "coinglass": false,
+    "kucoin_announcements": true
   },
   "_почему_выключено": {
     "okx_announcements": "корп-сеть сбрасывает соединение с okx.com по SNI (проверено 18.08.2026)",
@@ -143,5 +148,95 @@
     "min_liquidity_usd": 200000,
     "min_volume_h24_usd": 100000,
     "max_addresses": 8
+  },
+  "listing": {
+    "_комментарий": "Фильтры листингового слоя. Появились после инцидента: из 43 постируемых событий 19 были перпами на акции, 32 без распознанного тикера, а листинги монет с Binance подавались как новость.",
+    "tradfi_markers": [
+      "tradfi",
+      "tradifi",
+      "equity x-perp",
+      "equity perp",
+      "x-perps",
+      "equities",
+      "tokenized stock",
+      "tokenized equit",
+      "pre-ipo",
+      "pre-market",
+      "stock perpetual",
+      "us stock",
+      "xstock",
+      "nasdaq",
+      "nyse"
+    ],
+    "post_classes": [
+      "STRONG_BULLISH",
+      "BEARISH_SETUP",
+      "OPERATIONAL"
+    ],
+    "major_exchanges": [
+      "BINANCE",
+      "UPBIT",
+      "COINBASE"
+    ],
+    "monitored_exchanges": [
+      "BINANCE",
+      "BYBIT",
+      "UPBIT",
+      "OKX",
+      "KUCOIN"
+    ],
+    "parse_failed_warn_share": 0.3,
+    "instruments_db": "C:/Users/a.yermekbayev/pumpbot/context_cache.db",
+    "quote_assets": [
+      "USDT",
+      "USDC",
+      "KRW"
+    ],
+    "not_tickers": [
+      "USDT",
+      "USDC",
+      "BUSD",
+      "USD",
+      "KRW",
+      "BTC",
+      "ETH",
+      "NFT",
+      "API",
+      "CEO",
+      "USA",
+      "SEC",
+      "ETF",
+      "DEX",
+      "CEX",
+      "AMA",
+      "APR",
+      "APY",
+      "TVL",
+      "P2P",
+      "AND",
+      "THE",
+      "FOR",
+      "NEW",
+      "WILL",
+      "SPOT",
+      "IPO",
+      "CET",
+      "UTC",
+      "PERP"
+    ]
+  },
+  "publisher": {
+    "_комментарий": "Единственная точка отправки событий в канал. Лимиты и выключатель — защита от повторения инцидента.",
+    "enabled": true,
+    "shadow_sources": [],
+    "max_per_hour": 6,
+    "max_per_day": 20,
+    "post_event_types": [
+      "LISTING",
+      "DELISTING",
+      "PERP_LAUNCH",
+      "NEW_INSTRUMENT",
+      "HACK"
+    ]
   }
 }

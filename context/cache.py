@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS events (
     payload TEXT,
     ttl_ts REAL NOT NULL,
     matched_rule TEXT,
+    published_ts REAL,
+    publish_decision TEXT,
     UNIQUE(source, url, title)
 );
 CREATE INDEX IF NOT EXISTS idx_events_ticker_ts ON events(ticker, ts);
@@ -109,6 +111,10 @@ class Cache:
         columns = {r[1] for r in self.conn.execute("PRAGMA table_info(coins)")}
         if "platforms" not in columns:
             self.conn.execute("ALTER TABLE coins ADD COLUMN platforms TEXT")
+        event_columns = {r[1] for r in self.conn.execute("PRAGMA table_info(events)")}
+        for column, ddl in (("published_ts", "REAL"), ("publish_decision", "TEXT")):
+            if column not in event_columns:
+                self.conn.execute(f"ALTER TABLE events ADD COLUMN {column} {ddl}")
         self.conn.commit()
 
     def close(self) -> None:
@@ -123,12 +129,15 @@ class Cache:
                   symbol: str = None, ticker: str = None, title: str = None, url: str = None,
                   payload: dict = None, ttl_sec: float = 172800.0, matched_rule: str = None) -> bool:
         """True — событие новое. Дубли гасятся уникальным (source, url, title)."""
+        # TTL считается от МОМЕНТА ЗАПИСИ, а не от даты объявления: иначе старое по
+        # дате событие удаляется сразу после обработки, на следующем проходе
+        # добавляется заново и отправляется повторно — механика спама
         try:
             self.conn.execute(
                 "INSERT INTO events (ts, source, raw_type, event_type, symbol, ticker, title, url,"
                 " payload, ttl_ts, matched_rule) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (ts, source, raw_type, event_type, symbol, ticker, title, url,
-                 json.dumps(payload or {}, ensure_ascii=False), ts + ttl_sec, matched_rule))
+                 json.dumps(payload or {}, ensure_ascii=False), time.time() + ttl_sec, matched_rule))
             self.conn.commit()
             return True
         except sqlite3.IntegrityError:
@@ -146,9 +155,17 @@ class Cache:
         sql += " ORDER BY ts DESC"
         return [dict(r) for r in self.conn.execute(sql, params)]
 
-    def purge_expired(self, now_ts: float = None) -> int:
+    def purge_expired(self, now_ts: float = None, ledger_sec: float = 2592000.0) -> int:
+        """Чистка кэша. Обработанные события хранятся дольше — это журнал против повторов.
+
+        Удалить строку с отметкой публикации значит разрешить отправить это событие
+        второй раз, когда источник снова его отдаст.
+        """
         now_ts = now_ts if now_ts is not None else time.time()
-        cur = self.conn.execute("DELETE FROM events WHERE ttl_ts < ?", (now_ts,))
+        cur = self.conn.execute(
+            "DELETE FROM events WHERE ttl_ts < ?"
+            " AND (published_ts IS NULL OR published_ts < ?)",
+            (now_ts, now_ts - ledger_sec))
         self.conn.commit()
         return cur.rowcount
 
