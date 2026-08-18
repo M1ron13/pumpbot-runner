@@ -10,3 +10,7 @@ gas/Config.gs
 .cache/
 backtest_run.log
 backtest.xlsx
+context_cache.db
+context_cache.db-wal
+context_cache.db-shm
+context_monitor.log

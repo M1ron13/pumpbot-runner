@@ -26,6 +26,13 @@ CONFIG_DEFAULT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 
 log = logging.getLogger("pumpbot")
 
+# Контекст-слой подключается опционально и только как источник ДОПОЛНЕНИЯ к сообщению.
+# Детекция, формулы и пороги от него не зависят: нет модуля — бот работает как раньше.
+try:
+    from context.enrich import enrich_alert as _context_enrich
+except Exception:      # noqa: BLE001 — слой не обязателен, любая его проблема не наша
+    _context_enrich = None
+
 
 def now() -> float:
     """Единственный источник времени в боте.
@@ -1377,6 +1384,26 @@ class PumpBot:
         self.save_state(f"выход: {self.stop_reason}")
         log.info("остановлен (%s)", self.stop_reason)
 
+    async def context_block(self, alert: Alert) -> str:
+        """Блок контекста от внешнего слоя. Пустая строка, если его нет или не успел.
+
+        Жёсткое правило: алерт не ждёт слой. Здесь стоит внешний предел по времени
+        поверх собственного бюджета слоя, а любое исключение гасится — сообщение
+        уходит в исходном виде.
+        """
+        if _context_enrich is None or not self.cfg.get("context_layer", {}).get("enabled"):
+            return ""
+        limit_ms = float(self.cfg["context_layer"].get("hard_limit_ms", 3500))
+        try:
+            block = await asyncio.wait_for(_context_enrich(alert, self.cfg),
+                                           timeout=limit_ms / 1000.0)
+            return f"\n{block}" if block else ""
+        except asyncio.TimeoutError:
+            log.warning("контекст-слой не уложился в %.0f мс — алерт уходит без него", limit_ms)
+        except Exception as exc:
+            log.warning("контекст-слой пропущен: %s", exc)
+        return ""
+
     async def enrich(self, alert: Alert, feed: Feed) -> None:
         """Слои 1-2: чем дышит импульс (OI) и есть ли у него причина (событие)."""
         sig = alert.primary
@@ -1553,7 +1580,7 @@ class PumpBot:
                 sig.symbol, "+".join(alert.exchanges), "+".join(sig.triggers),
                 sig.move_15m, sig.zscore, sig.vol_mult,
             )
-            await telegram.send(render_alert(alert, self.cfg))
+            await telegram.send(render_alert(alert, self.cfg) + await self.context_block(alert))
             if self.journal is not None:
                 try:
                     self.journal.record(alert)

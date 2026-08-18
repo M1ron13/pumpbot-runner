@@ -150,5 +150,10 @@
   "journal": {
     "db_file": "signals.db",
     "outcome_check_sec": 300
+  },
+  "context_layer": {
+    "enabled": true,
+    "hard_limit_ms": 3500,
+    "config_file": "context_config.json"
   }
 }

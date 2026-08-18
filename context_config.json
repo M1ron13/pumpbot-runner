@@ -1,0 +1,147 @@
+{
+  "_комментарий": "Контекст-слой: отдельный файл, чтобы правки whitelist/TTL/интервалов не трогали config.json, который читает детектор.",
+  "enabled": true,
+  "cache_db": "context_cache.db",
+  "budget": {
+    "total_ms": 3000,
+    "per_source_ms": 2000,
+    "hook_grace_ms": 200
+  },
+  "monitor": {
+    "bybit_sec": 60,
+    "binance_sec": 60,
+    "upbit_sec": 60,
+    "okx_sec": 120,
+    "instruments_sec": 300,
+    "unlocks_sec": 3600,
+    "coinmarketcal_sec": 3600,
+    "coins_dictionary_sec": 86400,
+    "event_ttl_sec": 172800
+  },
+  "sources": {
+    "bybit_announcements": "https://api.bybit.com/v5/announcements/index?locale=en-US&limit=50",
+    "binance_cms": "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&catalogId={catalog}&pageNo=1&pageSize=20",
+    "binance_cms_catalogs": [
+      48,
+      161
+    ],
+    "binance_rss_fallback": "https://www.binance.com/en/support/announcement/c-48?navId=48",
+    "upbit_announcements": "https://api-manager.upbit.com/api/v1/announcements?os=web&page=1&per_page=20&category=all",
+    "okx_announcements": "https://www.okx.com/api/v5/support/announcements?page=1",
+    "binance_exchange_info": "https://fapi.binance.com/fapi/v1/exchangeInfo",
+    "binance_spot_info": "https://api.binance.com/api/v3/exchangeInfo",
+    "bybit_instruments": "https://api.bybit.com/v5/market/instruments-info?category={category}&limit=1000",
+    "long_short_ratio": "https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol={symbol}&period=5m&limit=6",
+    "open_interest_hist": "https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=5m&limit=6",
+    "taker_ratio": "https://fapi.binance.com/futures/data/takerlongshortRatio?symbol={symbol}&period=5m&limit=6",
+    "dexscreener_search": "https://api.dexscreener.com/latest/dex/search?q={query}",
+    "coingecko_coins": "https://api.coingecko.com/api/v3/coins/list?include_platform=true",
+    "cryptopanic_posts": "https://cryptopanic.com/api/v1/posts/?auth_token={token}&currencies={ticker}&public=true",
+    "tavily_search": "https://api.tavily.com/search",
+    "coinmarketcal_events": "https://developers.coinmarketcal.com/v1/events",
+    "dexscreener_tokens": "https://api.dexscreener.com/latest/dex/tokens/{address}"
+  },
+  "enabled_sources": {
+    "bybit_announcements": true,
+    "binance_announcements": true,
+    "upbit_announcements": true,
+    "okx_announcements": false,
+    "instruments_diff": true,
+    "unlocks": true,
+    "coinmarketcal": false,
+    "derivatives": true,
+    "dexscreener": true,
+    "tavily": false,
+    "cryptopanic": false,
+    "arkham": false,
+    "coinglass": false
+  },
+  "_почему_выключено": {
+    "okx_announcements": "корп-сеть сбрасывает соединение с okx.com по SNI (проверено 18.08.2026)",
+    "tavily": "нужен TAVILY_API_KEY: MCP-коннектор доступен только в сессии Claude Code, боту — нет",
+    "cryptopanic": "нужен CRYPTOPANIC_TOKEN, без него источник отдаёт HTTP 403",
+    "coinmarketcal": "нужен COINMARKETCAL_KEY",
+    "alpha_vantage": "не подключаем: бесплатный тир 25 запросов в сутки — для алертов бесполезен",
+    "arkham": "интерфейс предусмотрен, реализация позже",
+    "coinglass": "платный; поле под ликвидации в risk_context зарезервировано"
+  },
+  "matching": {
+    "short_ticker_max_len": 4,
+    "require_name_for_short_ticker": true,
+    "min_project_name_len": 4,
+    "source_whitelist": [
+      "reuters.com",
+      "bloomberg.com",
+      "apnews.com",
+      "wsj.com",
+      "ft.com",
+      "coindesk.com",
+      "cointelegraph.com",
+      "theblock.co",
+      "decrypt.co",
+      "binance.com",
+      "bybit.com",
+      "okx.com",
+      "upbit.com",
+      "sec.gov"
+    ],
+    "news_freshness_sec": 86400
+  },
+  "classification": {
+    "provider": "groq",
+    "groq_model": "llama-3.3-70b-versatile",
+    "groq_url": "https://api.groq.com/openai/v1/chat/completions",
+    "anthropic_model": "claude-haiku-4-5-20251001",
+    "anthropic_url": "https://api.anthropic.com/v1/messages",
+    "max_headlines": 12,
+    "retries": 1,
+    "timeout_ms": 2000,
+    "catalyst": {
+      "direction": "bullish",
+      "min_confidence": 0.75,
+      "require_fact_or_tier": 2
+    },
+    "bearish": {
+      "direction": "bearish",
+      "min_confidence": 0.6
+    }
+  },
+  "dedup": {
+    "shingle_size": 2,
+    "similarity_threshold": 0.55,
+    "opposite_markers": [
+      "delist",
+      "remove",
+      "suspend",
+      "halt",
+      "denies",
+      "опровер",
+      "прекращ",
+      "종료",
+      "폐지"
+    ]
+  },
+  "cross_listing": {
+    "major_exchanges": [
+      "BINANCE",
+      "UPBIT",
+      "COINBASE"
+    ],
+    "post_weak_to_channel": false,
+    "listing_lookback_sec": 86400
+  },
+  "context_window": {
+    "events_within_sec": 3600,
+    "listing_within_sec": 86400,
+    "unlock_ahead_days": 7
+  },
+  "derivatives_flags": {
+    "high_long_short_ratio": 2.5,
+    "oi_jump_pct": 5.0
+  },
+  "dex_filters": {
+    "min_liquidity_usd": 200000,
+    "min_volume_h24_usd": 100000,
+    "max_addresses": 8
+  }
+}
